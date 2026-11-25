@@ -41,6 +41,16 @@ Quick load probe (writes nothing):
 node tools/loadtest.js 400 60
 ```
 
+## Cache and usage monitoring
+
+- **Response cache:** identical non-streaming requests are cached in memory (default 10 min TTL, 500 entries, 512 KB per entry). Cache hits return instantly with `x-logic-router-cache: HIT`. Set `"cache": false` or `"cache_control": {"type": "no-cache"}` in a request to bypass it.
+- **Single-flight:** concurrent identical requests share one upstream call (`COALESCED`).
+- **Stale fallback:** if every provider fails, a recently expired cached response is returned with `STALE` instead of an error.
+- **Monitor:** the **Cache** tab shows hit rate, entries, saved requests/tokens, TTL controls and a preview of cached entries. `/api/cache`, `/api/cache/clear` expose the same data.
+- **Usage:** requests, tokens and estimated list-price value are recorded per provider and per day (30 days retained). The **Usage** tab shows 7-day bars and a provider table. `/api/usage` returns the raw counters. Estimates are clearly labeled, not billed amounts.
+- **Request IDs:** every response carries `x-request-id`; pass your own via the same header. IDs appear in logs.
+- **Runtime config:** `/api/config` GET/PATCH tunes cache, concurrency, retries and breaker threshold without a restart. Environment variables `CACHE=0`, `CACHE_TTL_MS`, `CACHE_MAX`, `CACHE_ENTRY_MAX` and `ACCESS_LOG=logs/access.jsonl` set defaults and optional JSONL access logging.
+
 ## Setup
 
 In the **Keys** tab, add a key for any provider, then use `auto` as the model in your client or in **Chat**.

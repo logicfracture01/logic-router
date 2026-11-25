@@ -89,6 +89,12 @@ nav button.on{color:var(--accent);background:var(--accent-soft)}
 #toast.show{opacity:1;transform:translate(-50%,0)}
 #toast.bad{background:var(--err)}
 a{color:var(--accent)}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th,td{text-align:left;padding:7px 4px;border-bottom:1px solid var(--border)}
+th{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.05em;font-weight:600}
+td.num,th.num{text-align:right}
+.barline{height:4px;background:#eef0f3;border-radius:2px;overflow:hidden;margin-top:5px}
+.barline i{display:block;height:100%;background:var(--accent)}
 </style>
 </head>
 <body>
@@ -138,6 +144,39 @@ a{color:var(--accent)}
   <div class="err" id="chatErr"></div>
 </section>
 
+<section id="tab-cache">
+  <div class="stats">
+    <div class="stat"><b id="c-rate">0%</b><span>Hit rate</span></div>
+    <div class="stat"><b id="c-entries">0</b><span>Entries</span></div>
+    <div class="stat"><b id="c-saved">0</b><span>Saved reqs</span></div>
+  </div>
+  <div class="card">
+    <div class="row" style="margin-bottom:12px"><span class="small" style="flex:1">Response cache</span><button class="text" id="cacheToggle" onclick="cacheToggle()">Disable</button></div>
+    <div class="row">
+      <input id="cacheTtl" type="number" min="1" max="86400" placeholder="TTL in seconds" style="flex:1">
+      <button onclick="cacheApply()">Apply</button>
+      <button class="danger" onclick="cacheClear()">Clear</button>
+    </div>
+    <div class="hint" id="cacheHint">Identical non-streaming requests are served from memory. TTL in seconds.</div>
+    <div class="small" id="cacheDetail" style="margin-top:10px"></div>
+  </div>
+  <h2>Cached entries</h2>
+  <div class="card" id="cacheEntries"></div>
+</section>
+
+<section id="tab-usage">
+  <div class="stats">
+    <div class="stat"><b id="u-req">0</b><span>Requests</span></div>
+    <div class="stat"><b id="u-tok">0</b><span>Tokens</span></div>
+    <div class="stat"><b id="u-saved">$0</b><span>Est. saved</span></div>
+  </div>
+  <h2>Last 7 days</h2>
+  <div class="card" id="usageDays"></div>
+  <h2>By provider</h2>
+  <div class="card" id="usageProviders"></div>
+  <div class="hint">Estimated value uses approximate list-price rates. It is not a billed amount.</div>
+</section>
+
 <section id="tab-logs">
   <h2>Activity</h2>
   <div class="card" id="logs"></div>
@@ -150,6 +189,8 @@ a{color:var(--accent)}
   <button class="on" data-tab="home" onclick="go('home')">Home</button>
   <button data-tab="keys" onclick="go('keys')">Keys</button>
   <button data-tab="chat" onclick="go('chat')">Chat</button>
+  <button data-tab="cache" onclick="go('cache')">Cache</button>
+  <button data-tab="usage" onclick="go('usage')">Usage</button>
   <button data-tab="logs" onclick="go('logs')">Logs</button>
 </nav>
 <div id="toast"></div>
@@ -157,7 +198,7 @@ a{color:var(--accent)}
 <script>
 let TOKEN='__TOKEN__';
 const H=()=>({'Content-Type':'application/json','Authorization':'Bearer '+TOKEN});
-let catalog={},selectedProvider='groq',streaming=false;
+let catalog={},selectedProvider='groq',streaming=false,cacheCfg={},cacheData=null,usageData=null;
 const $=id=>document.getElementById(id);
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function toast(msg,bad){const t=$('toast');t.textContent=msg;t.className='show'+(bad?' bad':'');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',2600);}
@@ -169,8 +210,35 @@ function pick(id){selectedProvider=id;document.querySelectorAll('.chip').forEach
 function renderChips(){const box=$('chips');if(box.children.length)return;for(const [id,p] of Object.entries(catalog)){const b=document.createElement('button');b.className='chip';b.dataset.p=id;b.textContent=p.name;b.onclick=()=>pick(id);box.appendChild(b);}const c=document.createElement('button');c.className='chip';c.dataset.p='custom';c.textContent='Custom URL';c.onclick=()=>pick('custom');box.appendChild(c);pick('groq');}
 function renderModels(){const sel=$('model');if(sel.options.length>1)return;for(const m of [...new Set(Object.values(catalog).flatMap(p=>p.models))]){const o=document.createElement('option');o.value=m;o.textContent=m;sel.appendChild(o);}}
 function renderKeys(keys){$('keyCount').textContent=keys.length;const box=$('keys');if(!keys.length){box.innerHTML='<div class="empty">No keys configured. Add a free provider to start routing.</div>';return;}box.innerHTML=keys.map(k=>{const p=catalog[k.provider];const name=p?p.name:(k.label?esc(k.label.replace(/^https?:\/\//,'')):'Custom');const r1=p&&p.rpm?Math.min(100,Math.round(k.rpm/p.rpm*100)):0;const r2=p&&p.rpd?Math.min(100,Math.round(k.rpd/p.rpd*100)):0;return `<div class="keycard"><div class="keyhead"><b>${esc(name)}</b><span class="pill ${k.enabled?'on':'off'}">${k.enabled?'active':'paused'}</span>${k.cooling>0?`<span class="pill cool">${Math.ceil(k.cooling/1000)}s</span>`:''}<span class="spacer"></span><span class="small">${esc(k.masked)}</span></div><div class="small" style="margin-top:7px">${k.rpm}/min${p&&p.rpm?' of '+p.rpm:''} · ${k.rpd} today${p&&p.rpd?' of '+p.rpd:''} · ${k.fails} failures</div>${p&&p.rpm?`<div class="bar"><i style="width:${r1}%"></i></div>`:''}${p&&p.rpd?`<div class="bar w"><i style="width:${r2}%"></i></div>`:''}${k.lastError?`<div class="small" style="color:var(--err);margin-top:6px">last error ${esc(k.lastError.slice(11,19))}</div>`:''}<div class="actions"><button class="text" onclick="act('${k.id}','${k.enabled?'enabled:false':'enabled:true'}')">${k.enabled?'Pause':'Enable'}</button>${k.cooling>0?`<button class="text" onclick="act('${k.id}','uncool')">Clear cooldown</button>`:''}<button class="text danger" data-c="0" onclick="del(this,'${k.id}')">Remove</button></div></div>`;}).join('');}
+function fmtNum(n){n=Number(n)||0;return n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':String(n);}
+function fmtMoney(n){return '$'+(Number(n)||0).toFixed(4);}
 function renderLogs(log){$('logs').innerHTML=log.length?log.map(l=>`<div class="log"><span class="tag ${l.kind==='ok'?'':'fail'}">${esc(l.kind)}</span><span>${esc(l.provider||'')} ${esc(l.model||'')}${l.status?' · '+l.status:''}</span><time>${esc((l.t||'').slice(11,19))}</time></div>`).join(''):'<div class="small">No requests yet.</div>';}
-async function refresh(){try{const s=await api('/api/status');$('endpoint').textContent=s.endpoint;$('token').textContent=s.token;catalog=s.catalog;renderChips();renderModels();renderKeys(s.keys);renderLogs(s.log);$('s-keys').textContent=s.keys.filter(k=>k.enabled).length;$('s-req').textContent=s.keys.reduce((a,k)=>a+k.rpd,0);$('s-fail').textContent=s.keys.reduce((a,k)=>a+k.fails,0);}catch(e){toast('Status: '+e.message,true);}}
+function renderCache(c,cfg){
+  cacheData=c;cacheCfg=cfg;
+  $('c-rate').textContent=c.hitRate+'%';$('c-entries').textContent=c.entries;$('c-saved').textContent=fmtNum(c.hits+c.coalesced+c.stale);
+  $('cacheToggle').textContent=c.enabled?'Disable':'Enable';
+  if(document.activeElement!==$('cacheTtl'))$('cacheTtl').value=Math.round(c.ttl/1000);
+  $('cacheHint').textContent=`${c.enabled?'On':'Off'} · TTL ${Math.round(c.ttl/1000)}s · max ${c.max} entries · ${(c.bytes/1024).toFixed(1)} KB stored · ${c.evicted} evicted · ${c.expired} expired`;
+  $('cacheDetail').textContent=`hits ${c.hits} · misses ${c.misses} · coalesced ${c.coalesced} · stale fallback ${c.stale} · tokens saved ${fmtNum(c.savedTokens)}`;
+  $('cacheEntries').innerHTML=c.entriesPreview.length?`<table><thead><tr><th>Key</th><th>Model</th><th>Age</th><th class="num">Hits</th><th class="num">KB</th></tr></thead><tbody>${c.entriesPreview.map(e=>`<tr><td>${esc(e.key)}</td><td>${esc(e.model)}</td><td>${Math.round(e.age/1000)}s</td><td class="num">${e.hits}</td><td class="num">${(e.size/1024).toFixed(1)}</td></tr>`).join('')}</tbody></table>`:'<div class="small">Nothing cached yet. Identical non-streaming requests are stored automatically.</div>';
+}
+function renderUsage(u){
+  if(!u)return;usageData=u;
+  $('u-req').textContent=fmtNum(u.totals.requests);$('u-tok').textContent=fmtNum(u.totals.tokensIn+u.totals.tokensOut);$('u-saved').textContent=fmtMoney(u.totals.estSaved);
+  const max=Math.max(1,...u.days.map(d=>d.requests));
+  $('usageDays').innerHTML=u.days.length?u.days.map(d=>`<div style="margin-bottom:9px"><div class="row"><span class="small" style="flex:1">${esc(d.day)}</span><span class="small">${d.requests} req · ${fmtNum(d.tokensIn+d.tokensOut)} tok · ${fmtMoney(d.estSaved)}</span></div><div class="barline"><i style="width:${Math.round(d.requests/max*100)}%"></i></div></div>`).join(''):'<div class="small">No usage recorded yet.</div>';
+  const prov=Object.entries(u.providers||{}).sort((a,b)=>b[1].requests-a[1].requests);
+  $('usageProviders').innerHTML=prov.length?`<table><thead><tr><th>Provider</th><th class="num">Req</th><th class="num">Tokens</th><th class="num">Est.</th></tr></thead><tbody>${prov.map(([name,v])=>`<tr><td>${esc(name)}</td><td class="num">${v.requests}</td><td class="num">${fmtNum(v.tokensIn+v.tokensOut)}</td><td class="num">${fmtMoney(v.estSaved)}</td></tr>`).join('')}</tbody></table>`:'<div class="small">No provider usage yet.</div>';
+}
+async function refresh(){try{
+  const [s,c,u,cfg]=await Promise.all([api('/api/status'),api('/api/cache'),api('/api/usage'),api('/api/config')]);
+  $('endpoint').textContent=s.endpoint;$('token').textContent=s.token;catalog=s.catalog;renderChips();renderModels();renderKeys(s.keys);renderLogs(s.log);
+  $('s-keys').textContent=s.keys.filter(k=>k.enabled).length;$('s-req').textContent=s.keys.reduce((a,k)=>a+k.rpd,0);$('s-fail').textContent=s.keys.reduce((a,k)=>a+k.fails,0);
+  renderCache(c,cfg);renderUsage(u);
+}catch(e){toast('Status: '+e.message,true);}}
+async function cacheClear(){try{await api('/api/cache/clear',{method:'POST',body:'{}'});toast('Cache cleared');refresh();}catch(e){toast(e.message,true);}}
+async function cacheToggle(){try{await api('/api/config',{method:'PATCH',body:JSON.stringify({cacheEnabled:!cacheData.enabled})});toast('Cache updated');refresh();}catch(e){toast(e.message,true);}}
+async function cacheApply(){const sec=Number($('cacheTtl').value)||600;try{await api('/api/config',{method:'PATCH',body:JSON.stringify({cacheTtl:sec*1000})});toast('TTL set to '+sec+'s');refresh();}catch(e){toast(e.message,true);}}
 async function addKey(){const key=$('key').value.trim();if(!key){$('addErr').textContent='Paste a key first';return;}let body={provider:selectedProvider,key,label:''};if(selectedProvider==='custom'){const i=key.indexOf('|');if(i<1){$('addErr').textContent='Use baseUrl|key';return;}body.label=key.slice(0,i).trim();body.key=key.slice(i+1).trim();}const btn=$('addBtn');btn.disabled=true;btn.textContent='Adding…';$('addErr').textContent='';try{await api('/api/keys',{method:'POST',body:JSON.stringify(body)});$('key').value='';toast('Key added');await refresh();}catch(e){$('addErr').textContent=e.message;}finally{btn.disabled=false;btn.textContent='Add key';}}
 async function act(id,what){const body=what.startsWith('enabled:')?{enabled:what.endsWith('true')}:{cooldownUntil:0};try{await api('/api/keys/'+id,{method:'PATCH',body:JSON.stringify(body)});await refresh();toast('Updated');}catch(e){toast(e.message,true);}}
 function del(btn,id){if(btn.dataset.c==='1'){api('/api/keys/'+id,{method:'DELETE'}).then(()=>{toast('Key removed');refresh();}).catch(e=>toast(e.message,true));return;}btn.dataset.c='1';btn.textContent='Confirm';setTimeout(()=>{if(btn.isConnected){btn.dataset.c='0';btn.textContent='Remove';}},2500);}

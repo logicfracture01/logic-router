@@ -34,6 +34,114 @@ const CFG = {
 const jitter = (ms) => Math.floor(Math.random() * ms);
 
 // ---------------------------------------------------------------------------
+// Response cache, in-flight coalescing, usage accounting, runtime config
+// ---------------------------------------------------------------------------
+let CACHE_ENABLED = process.env.CACHE !== '0';
+let CACHE_TTL = intEnv('CACHE_TTL_MS', 600000, 1000, 86400000);
+let CACHE_MAX = intEnv('CACHE_MAX', 500, 1, 20000);
+let CACHE_ENTRY_MAX = intEnv('CACHE_ENTRY_MAX', 524288, 1024, 8388608);
+const ACCESS_LOG = process.env.ACCESS_LOG || ''; // optional JSONL access log
+
+const cache = new Map();          // key -> entry (insertion order = LRU)
+const inflightByKey = new Map();  // key -> shared promise for identical calls
+const cacheStats = { hits: 0, misses: 0, coalesced: 0, stale: 0, stored: 0, evicted: 0, expired: 0, bytes: 0, savedTokens: 0 };
+
+const USAGE_RATES = { // approximate list-price USD per 1M tokens, for "value saved" estimates only
+  groq: { in: 0.5, out: 0.8 }, gemini: { in: 0.3, out: 1.2 }, openrouter: { in: 0.4, out: 1.5 },
+  tokenharbor: { in: 0.3, out: 1.2 }, opentyphoon: { in: 0.2, out: 0.6 }, requesty: { in: 0.3, out: 1 },
+  meganova: { in: 0.3, out: 1 }, kilo: { in: 0.3, out: 1 }, freeinference: { in: 0.3, out: 1 },
+  radeon: { in: 0.3, out: 1 }, custom: { in: 0, out: 0 },
+};
+function freshUsage() { return { days: {}, providers: {} }; }
+const today = () => new Date().toISOString().slice(0, 10);
+function usageBucket() {
+  const d = today();
+  return state.usage.days[d] || (state.usage.days[d] = { requests: 0, ok: 0, fail: 0, tokensIn: 0, tokensOut: 0, estSaved: 0, cached: 0 });
+}
+function recordUsage(provider, ok, usage) {
+  if (!state.usage) state.usage = freshUsage();
+  const d = usageBucket();
+  const tin = Math.max(0, Number(usage && usage.prompt_tokens) || 0);
+  const tout = Math.max(0, Number(usage && usage.completion_tokens) || 0);
+  const rate = USAGE_RATES[provider] || USAGE_RATES.custom;
+  const saved = (tin * rate.in + tout * rate.out) / 1e6;
+  d.requests++; if (ok) d.ok++; else d.fail++;
+  d.tokensIn += tin; d.tokensOut += tout; d.estSaved += saved;
+  const pp = state.usage.providers[provider] || (state.usage.providers[provider] = { requests: 0, ok: 0, fail: 0, tokensIn: 0, tokensOut: 0, estSaved: 0 });
+  pp.requests++; if (ok) pp.ok++; else pp.fail++;
+  pp.tokensIn += tin; pp.tokensOut += tout; pp.estSaved += saved;
+  const keys = Object.keys(state.usage.days).sort();
+  while (keys.length > 30) delete state.usage.days[keys.shift()];
+  persist();
+}
+function recordCacheHit(entry) {
+  if (!state.usage) state.usage = freshUsage();
+  const d = usageBucket();
+  d.cached++;
+  const rate = USAGE_RATES[entry.provider] || USAGE_RATES.custom;
+  d.estSaved += ((entry.tokensIn || 0) * rate.in + (entry.tokensOut || 0) * rate.out) / 1e6;
+  persist();
+}
+function cacheKey(model, body) {
+  const material = JSON.stringify({ model, messages: body.messages, temperature: body.temperature, top_p: body.top_p, max_tokens: body.max_tokens, tools: body.tools, response_format: body.response_format });
+  return crypto.createHash('sha256').update(material).digest('hex');
+}
+function cacheGet(key) {
+  const e = cache.get(key);
+  if (!e) { cacheStats.misses++; return null; }
+  if (Date.now() - e.stored > CACHE_TTL) {
+    cache.delete(key); cacheStats.bytes -= e.size; cacheStats.expired++; cacheStats.misses++;
+    return null;
+  }
+  e.hits++;
+  cacheStats.hits++;
+  cache.delete(key); cache.set(key, e);
+  cacheStats.savedTokens += (e.tokensIn || 0) + (e.tokensOut || 0);
+  recordCacheHit(e);
+  return e;
+}
+function cacheGetStale(key) {
+  const e = cache.get(key);
+  if (!e || Date.now() - e.stored > CACHE_TTL * 3) return null;
+  return e;
+}
+function cacheSet(key, value, meta) {
+  if (!CACHE_ENABLED) return;
+  const buf = Buffer.from(JSON.stringify(value));
+  if (buf.length > CACHE_ENTRY_MAX) return;
+  while (cache.size >= CACHE_MAX) {
+    const oldest = cache.keys().next().value;
+    const old = cache.get(oldest);
+    cache.delete(oldest); cacheStats.bytes -= old.size; cacheStats.evicted++;
+  }
+  cache.set(key, { value, stored: Date.now(), hits: 0, size: buf.length, model: meta.model, provider: meta.provider, tokensIn: meta.tokensIn || 0, tokensOut: meta.tokensOut || 0 });
+  cacheStats.bytes += buf.length; cacheStats.stored++;
+}
+function cacheSnapshot() {
+  const entries = [...cache.entries()].slice(0, 25).map(([key, e]) => ({
+    key: key.slice(0, 8), model: e.model, provider: e.provider,
+    age: Date.now() - e.stored, hits: e.hits, size: e.size, tokensIn: e.tokensIn, tokensOut: e.tokensOut,
+  }));
+  return {
+    enabled: CACHE_ENABLED, ttl: CACHE_TTL, max: CACHE_MAX, entries: cache.size,
+    hits: cacheStats.hits, misses: cacheStats.misses, coalesced: cacheStats.coalesced,
+    stale: cacheStats.stale, stored: cacheStats.stored, evicted: cacheStats.evicted,
+    expired: cacheStats.expired, bytes: cacheStats.bytes, savedTokens: cacheStats.savedTokens,
+    hitRate: cacheStats.hits + cacheStats.misses ? Math.round(cacheStats.hits / (cacheStats.hits + cacheStats.misses) * 1000) / 10 : 0,
+    entriesPreview: entries,
+  };
+}
+function accessLog(entry) {
+  if (!ACCESS_LOG) return;
+  try {
+    const file = path.isAbsolute(ACCESS_LOG) ? ACCESS_LOG : path.join(ROOT, ACCESS_LOG);
+    const line = JSON.stringify({ t: new Date().toISOString(), ...entry }) + '\n';
+    if (fs.existsSync(file) && fs.statSync(file).size > 5 * 1024 * 1024) fs.renameSync(file, file + '.1');
+    fs.appendFileSync(file, line);
+  } catch {}
+}
+
+// ---------------------------------------------------------------------------
 // Provider catalog (standing free tiers only — no one-time credits)
 // ---------------------------------------------------------------------------
 const PROVIDERS = {
@@ -74,6 +182,9 @@ try {
 }
 if (!Array.isArray(state.keys)) state.keys = [];
 if (!Array.isArray(state.log)) state.log = [];
+if (!state.usage || typeof state.usage !== 'object') state.usage = freshUsage();
+if (!state.usage.days) state.usage.days = {};
+if (!state.usage.providers) state.usage.providers = {};
 for (const k of state.keys) {
   if (!k.requests) k.requests = freshCounters();
   if (!k.cb) k.cb = freshBreaker();
@@ -309,6 +420,8 @@ const startedAt = Date.now();
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://' + HOST);
   const p = url.pathname;
+  const rid = String(req.headers['x-request-id'] || '').slice(0, 64) || crypto.randomUUID().slice(0, 12);
+  res.setHeader('x-request-id', rid);
   try {
     // Unauthenticated liveness probe for the supervisor.
     if (p === '/health' && req.method === 'GET') {
@@ -318,6 +431,8 @@ const server = http.createServer(async (req, res) => {
         heapMB: Math.round(process.memoryUsage().heapUsed / 1048576),
         keys: state.keys.filter((k) => k.enabled).length,
         openBreakers: state.keys.filter((k) => k.cb && k.cb.state === 'open').length,
+        cache: { enabled: CACHE_ENABLED, entries: cache.size, hitRate: cacheSnapshot().hitRate },
+        requestsToday: (state.usage.days[today()] || {}).requests || 0,
       });
     }
     if (p === '/' || p === '/index.html') {
@@ -353,8 +468,39 @@ const server = http.createServer(async (req, res) => {
           queueTimeouts: metrics.queueTimeouts, upstreamTimeouts: metrics.upstreamTimeouts,
           retries: metrics.retries, inflight, queue: waiters.length, limit: effectiveLimit(),
           latency: { p50: percentile(0.5), p95: percentile(0.95), p99: percentile(0.99) },
-          providers: metrics.providers, system: sysLog.slice(0, 30),
+          providers: metrics.providers, cache: cacheSnapshot(), usageToday: state.usage.days[today()] || null,
+          system: sysLog.slice(0, 30),
         });
+      }
+      if (p === '/api/cache' && req.method === 'GET') return json(res, 200, cacheSnapshot());
+      if (p === '/api/cache/clear' && req.method === 'POST') {
+        cache.clear(); cacheStats.bytes = 0; cacheStats.stored = 0; cacheStats.hits = 0; cacheStats.misses = 0; cacheStats.savedTokens = 0;
+        slog('cache-cleared', 'manual');
+        return json(res, 200, { ok: true });
+      }
+      if (p === '/api/usage' && req.method === 'GET') {
+        const days = Object.entries(state.usage.days).sort((a, b) => b[0].localeCompare(a[0])).slice(0, 7).map(([day, v]) => ({ day, ...v }));
+        return json(res, 200, {
+          days, providers: state.usage.providers,
+          totals: days.reduce((a, d) => { for (const k of ['requests', 'ok', 'fail', 'tokensIn', 'tokensOut', 'estSaved', 'cached']) a[k] += d[k] || 0; return a; }, { requests: 0, ok: 0, fail: 0, tokensIn: 0, tokensOut: 0, estSaved: 0, cached: 0 }),
+          note: 'estSaved uses approximate list-price rates, not billed amounts.',
+        });
+      }
+      if (p === '/api/config' && req.method === 'GET') {
+        return json(res, 200, { cacheEnabled: CACHE_ENABLED, cacheTtl: CACHE_TTL, cacheMax: CACHE_MAX, maxInflight: CFG.maxInflight, maxQueue: CFG.maxQueue, keyInflight: CFG.keyInflight, retries: CFG.retries, breakerThreshold: CFG.breakerThreshold, upstreamTimeout: CFG.upstreamTimeout });
+      }
+      if (p === '/api/config' && req.method === 'PATCH') {
+        const b = JSON.parse(await readBody(req, 65536));
+        if (typeof b.cacheEnabled === 'boolean') CACHE_ENABLED = b.cacheEnabled;
+        if (b.cacheTtl != null) CACHE_TTL = Math.max(1000, Math.min(86400000, Number(b.cacheTtl) || CACHE_TTL));
+        if (b.cacheMax != null) CACHE_MAX = Math.max(1, Math.min(20000, Number(b.cacheMax) || CACHE_MAX));
+        if (b.maxInflight != null) CFG.maxInflight = Math.max(4, Math.min(512, Number(b.maxInflight) || CFG.maxInflight));
+        if (b.keyInflight != null) CFG.keyInflight = Math.max(1, Math.min(64, Number(b.keyInflight) || CFG.keyInflight));
+        if (b.retries != null) CFG.retries = Math.max(0, Math.min(3, Number(b.retries)));
+        if (b.breakerThreshold != null) CFG.breakerThreshold = Math.max(1, Math.min(20, Number(b.breakerThreshold) || CFG.breakerThreshold));
+        dynamicLimit = Math.min(dynamicLimit, CFG.maxInflight);
+        slog('config-updated', JSON.stringify(b));
+        return json(res, 200, { ok: true });
       }
       if (p === '/api/keys' && req.method === 'POST') {
         const b = JSON.parse(await readBody(req, 65536));
@@ -399,22 +545,65 @@ const server = http.createServer(async (req, res) => {
         catch (e) { return json(res, e.code === 'TOO_LARGE' ? 413 : 400, { error: { message: e.code === 'TOO_LARGE' ? 'request body too large' : 'invalid JSON' } }); }
         if (!body || !Array.isArray(body.messages)) return json(res, 400, { error: { message: 'messages must be an array' } });
 
+        const requested = typeof body.model === 'string' ? body.model : 'auto';
+        const wantStream = !!body.stream;
+        const noCache = body.cache === false || (body.cache_control && body.cache_control.type === 'no-cache');
+        delete body.cache; delete body.cache_control;
+        const ckey = cacheKey(requested, body);
+        const cacheable = CACHE_ENABLED && !wantStream && !noCache;
+
+        if (cacheable) {
+          const hit = cacheGet(ckey);
+          if (hit) {
+            metrics.requests++; metrics.ok++; recordLatency(0);
+            res.setHeader('x-logic-router-cache', 'HIT');
+            accessLog({ rid, status: 200, cache: 'HIT', model: requested });
+            return json(res, 200, hit.value);
+          }
+          const pending = inflightByKey.get(ckey);
+          if (pending) {
+            const shared = await pending.promise;
+            if (shared) {
+              metrics.requests++; metrics.ok++; cacheStats.coalesced++;
+              res.setHeader('x-logic-router-cache', 'COALESCED');
+              accessLog({ rid, status: 200, cache: 'COALESCED', model: requested });
+              return json(res, 200, shared);
+            }
+          }
+        }
+
+        let shared = null;
+        if (cacheable) {
+          shared = { resolve: null, promise: null };
+          shared.promise = new Promise((r) => { shared.resolve = r; });
+          inflightByKey.set(ckey, shared);
+        }
         let release;
         try { release = await acquireSlot(); }
         catch (e) {
+          if (shared) { inflightByKey.delete(ckey); shared.resolve(null); }
           const overloaded = e.code === 'OVERLOAD' || e.code === 'QUEUE_TIMEOUT';
           res.setHeader('Retry-After', e.code === 'OVERLOAD' ? '2' : '1');
           return json(res, 503, { error: { message: e.message, type: e.code === 'OVERLOAD' ? 'overloaded' : 'queue_timeout' } });
         }
         const t0 = Date.now();
         metrics.requests++;
-        const wantStream = !!body.stream;
         const payload = { ...body };
         delete payload.model; delete payload._droidrush; delete payload._keyId;
         const errors = [];
         try {
-          const candidates = await waitForCandidate(typeof body.model === 'string' ? body.model : 'auto', CFG.queueTimeout);
+          const candidates = await waitForCandidate(requested, CFG.queueTimeout);
           if (!candidates.length) {
+            if (cacheable) {
+              const stale = cacheGetStale(ckey);
+              if (stale) {
+                cacheStats.stale++;
+                res.setHeader('x-logic-router-cache', 'STALE');
+                accessLog({ rid, status: 200, cache: 'STALE', model: requested });
+                if (shared) shared.resolve(stale.value);
+                return json(res, 200, stale.value);
+              }
+            }
             return json(res, 503, { error: { message: 'no available free provider/key. Add a key or wait for cooldown.', type: 'no_provider' } });
           }
           for (const c of candidates) {
@@ -428,6 +617,7 @@ const server = http.createServer(async (req, res) => {
                 if (timeout) metrics.upstreamTimeouts++;
                 breakerFailure(c.key, timeout ? 10000 : 3000);
                 providerStat(c.provider.name).fail++;
+                recordUsage(c.provider.name, false, null);
                 errors.push(c.provider.name + ': ' + (timeout ? 'upstream timeout' : e.message));
                 if (!timeout && attempt < CFG.retries) { metrics.retries++; await sleep(150 + jitter(300)); continue; }
                 break;
@@ -441,15 +631,16 @@ const server = http.createServer(async (req, res) => {
                   const delay = parseRetryAfter(up);
                   breakerFailure(c.key, retryable ? delay : 5000);
                   providerStat(c.provider.name).fail++;
+                  recordUsage(c.provider.name, false, null);
                   errors.push(`${c.provider.name} HTTP ${status}: ${detail.slice(0, 160)}`);
-                  addLog({ kind: 'fail', provider: c.provider.name, model: c.model, status });
+                  addLog({ kind: 'fail', provider: c.provider.name, model: c.model, status, rid });
                   if (retryable && status >= 500 && attempt < CFG.retries) { metrics.retries++; await sleep(200 + jitter(400)); continue; }
                   break;
                 }
                 c.key.requests.min++; c.key.requests.hour++; c.key.requests.day++;
                 breakerSuccess(c.key);
                 providerStat(c.provider.name).ok++;
-                addLog({ kind: 'ok', provider: c.provider.name, model: c.model, stream: wantStream });
+                addLog({ kind: 'ok', provider: c.provider.name, model: c.model, stream: wantStream, rid });
 
                 if (wantStream) {
                   call.clear();
@@ -470,12 +661,20 @@ const server = http.createServer(async (req, res) => {
                   } finally {
                     clearTimeout(idle); reader.releaseLock(); res.end();
                   }
+                  recordUsage(c.provider.name, true, null);
+                  accessLog({ rid, status: 200, provider: c.provider.name, model: c.model, stream: true, ms: Date.now() - t0 });
                   metrics.ok++; adapt(true);
                   return;
                 }
                 const result = await up.json();
+                const tin = Math.max(0, Number(result.usage && result.usage.prompt_tokens) || 0);
+                const tout = Math.max(0, Number(result.usage && result.usage.completion_tokens) || 0);
                 if (!result.usage) result.usage = {};
                 result.usage.provider = c.provider.name;
+                cacheSet(ckey, result, { model: c.model, provider: c.provider.name, tokensIn: tin, tokensOut: tout });
+                recordUsage(c.provider.name, true, result.usage);
+                accessLog({ rid, status: 200, provider: c.provider.name, model: c.model, ms: Date.now() - t0, tokensIn: tin, tokensOut: tout });
+                if (shared) shared.resolve(result);
                 metrics.ok++; adapt(true);
                 return json(res, 200, result);
               } finally {
@@ -484,9 +683,21 @@ const server = http.createServer(async (req, res) => {
               }
             }
           }
+          if (cacheable) {
+            const stale = cacheGetStale(ckey);
+            if (stale) {
+              cacheStats.stale++;
+              res.setHeader('x-logic-router-cache', 'STALE');
+              if (shared) shared.resolve(stale.value);
+              return json(res, 200, stale.value);
+            }
+          }
+          if (shared) shared.resolve(null);
           metrics.failed++; adapt(false);
+          accessLog({ rid, status: 502, errors: errors.length, ms: Date.now() - t0 });
           return json(res, 502, { error: { message: 'all providers failed', type: 'upstream_error', details: errors } });
         } finally {
+          if (shared && inflightByKey.get(ckey) === shared) { inflightByKey.delete(ckey); shared.resolve(null); }
           recordLatency(Date.now() - t0);
           release();
         }
