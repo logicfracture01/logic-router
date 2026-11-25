@@ -9,7 +9,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 
 const ROOT = __dirname;
-const STATE_FILE = path.join(ROOT, 'state.json');
+const STATE_FILE = process.env.STATE_FILE || path.join(ROOT, 'state.json');
 const PORT = Number(process.env.PORT || 20129);
 const HOST = process.env.HOST || '127.0.0.1';
 
@@ -90,7 +90,8 @@ function cacheGet(key) {
   const e = cache.get(key);
   if (!e) { cacheStats.misses++; return null; }
   if (Date.now() - e.stored > CACHE_TTL) {
-    cache.delete(key); cacheStats.bytes -= e.size; cacheStats.expired++; cacheStats.misses++;
+    // Keep the entry: a later stale fallback may still serve it when upstreams fail.
+    cacheStats.expired++; cacheStats.misses++;
     return null;
   }
   e.hits++;
@@ -288,13 +289,14 @@ function resolveProvider(k) {
   return null;
 }
 
-function keyUsable(k, p, now) {
-  if (!k.enabled || !k.key || k.inflight >= CFG.keyInflight) return false;
+function keyUsable(k, p, now, possible) {
+  if (!k.enabled || !k.key) return false;
+  if (!possible && k.inflight >= CFG.keyInflight) return false;
   const cb = k.cb || (k.cb = freshBreaker());
   if (cb.state === 'open') {
     if (now < cb.openUntil) return false;
-    cb.state = 'half'; cb.probes = 0;
-  } else if (cb.state === 'half' && cb.probes >= 1) return false;
+    if (!possible) { cb.state = 'half'; cb.probes = 0; }
+  } else if (!possible && cb.state === 'half' && cb.probes >= 1) return false;
   if (k.cooldownUntil > now) return false;
   const r = k.requests;
   const minStamp = Math.floor(now / 60000), hourStamp = Math.floor(now / 3600000), dayStamp = new Date(now).toISOString().slice(0, 10);
@@ -356,11 +358,19 @@ function candidatesFor(model) {
 }
 
 async function waitForCandidate(model, timeout) {
+  const alias = ALIASES[model];
+  const target = alias === undefined ? model : alias;
   const deadline = Date.now() + Math.min(timeout, 10000);
   for (;;) {
     const ready = candidatesFor(model);
     if (ready.length) return ready;
-    if (Date.now() >= deadline) return [];
+    const now = Date.now();
+    const possible = state.keys.some((k) => {
+      const p = resolveProvider(k);
+      if (!p || !keyUsable(k, p, now, true)) return false;
+      return !target || !p.models.length || p.models.includes(target);
+    });
+    if (!possible || now >= deadline) return [];
     await sleep(50 + jitter(50));
   }
 }
@@ -398,14 +408,19 @@ function text(res, code, body, type) {
 }
 function readBody(req, limit) {
   return new Promise((resolve, reject) => {
-    let size = 0; const chunks = [];
+    let size = 0, tooLarge = false; const chunks = [];
     req.on('data', (c) => {
+      if (tooLarge) return; // keep draining so we can answer 413 cleanly
       size += c.length;
-      if (size > limit) { const e = new Error('body too large'); e.code = 'TOO_LARGE'; reject(e); req.destroy(); return; }
+      if (size > limit) {
+        tooLarge = true;
+        reject(Object.assign(new Error('body too large'), { code: 'TOO_LARGE' }));
+        return;
+      }
       chunks.push(c);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-    req.on('error', reject);
+    req.on('end', () => { if (!tooLarge) resolve(Buffer.concat(chunks).toString('utf8')); });
+    req.on('error', (e) => { if (!tooLarge) reject(e); });
   });
 }
 function authorized(req) {
@@ -420,7 +435,7 @@ const startedAt = Date.now();
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://' + HOST);
   const p = url.pathname;
-  const rid = String(req.headers['x-request-id'] || '').slice(0, 64) || crypto.randomUUID().slice(0, 12);
+  const rid = String(req.headers['x-request-id'] || '').replace(/[^A-Za-z0-9._:-]/g, '').slice(0, 64) || crypto.randomUUID().slice(0, 12);
   res.setHeader('x-request-id', rid);
   try {
     // Unauthenticated liveness probe for the supervisor.
@@ -490,14 +505,17 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { cacheEnabled: CACHE_ENABLED, cacheTtl: CACHE_TTL, cacheMax: CACHE_MAX, maxInflight: CFG.maxInflight, maxQueue: CFG.maxQueue, keyInflight: CFG.keyInflight, retries: CFG.retries, breakerThreshold: CFG.breakerThreshold, upstreamTimeout: CFG.upstreamTimeout });
       }
       if (p === '/api/config' && req.method === 'PATCH') {
-        const b = JSON.parse(await readBody(req, 65536));
+        let b;
+        try { b = JSON.parse(await readBody(req, 65536)); } catch { return json(res, 400, { error: 'invalid JSON' }); }
+        if (!b || typeof b !== 'object' || Array.isArray(b)) return json(res, 400, { error: 'object required' });
+        const num = (v, fallback, min, max) => { const n = Number(v); return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.floor(n))) : fallback; };
         if (typeof b.cacheEnabled === 'boolean') CACHE_ENABLED = b.cacheEnabled;
-        if (b.cacheTtl != null) CACHE_TTL = Math.max(1000, Math.min(86400000, Number(b.cacheTtl) || CACHE_TTL));
-        if (b.cacheMax != null) CACHE_MAX = Math.max(1, Math.min(20000, Number(b.cacheMax) || CACHE_MAX));
-        if (b.maxInflight != null) CFG.maxInflight = Math.max(4, Math.min(512, Number(b.maxInflight) || CFG.maxInflight));
-        if (b.keyInflight != null) CFG.keyInflight = Math.max(1, Math.min(64, Number(b.keyInflight) || CFG.keyInflight));
-        if (b.retries != null) CFG.retries = Math.max(0, Math.min(3, Number(b.retries)));
-        if (b.breakerThreshold != null) CFG.breakerThreshold = Math.max(1, Math.min(20, Number(b.breakerThreshold) || CFG.breakerThreshold));
+        if (b.cacheTtl != null) CACHE_TTL = num(b.cacheTtl, CACHE_TTL, 1000, 86400000);
+        if (b.cacheMax != null) CACHE_MAX = num(b.cacheMax, CACHE_MAX, 1, 20000);
+        if (b.maxInflight != null) CFG.maxInflight = num(b.maxInflight, CFG.maxInflight, 4, 512);
+        if (b.keyInflight != null) CFG.keyInflight = num(b.keyInflight, CFG.keyInflight, 1, 64);
+        if (b.retries != null) CFG.retries = num(b.retries, CFG.retries, 0, 3);
+        if (b.breakerThreshold != null) CFG.breakerThreshold = num(b.breakerThreshold, CFG.breakerThreshold, 1, 20);
         dynamicLimit = Math.min(dynamicLimit, CFG.maxInflight);
         slog('config-updated', JSON.stringify(b));
         return json(res, 200, { ok: true });
