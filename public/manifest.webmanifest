@@ -1,0 +1,10 @@
+{
+  "name": "Logic Router",
+  "short_name": "Logic Router",
+  "description": "Minimal local router for free LLM API tiers.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#ffffff",
+  "icons": []
+}

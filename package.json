@@ -1,0 +1,13 @@
+{
+  "name": "logic-router",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal local router for free LLM API tiers, built for Android/Termux.",
+  "bin": { "logic-router": "server.js" },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {},
+  "keywords": ["llm", "router", "proxy", "android", "termux", "free-api", "openai-compatible"]
+}

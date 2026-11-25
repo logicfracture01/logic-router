@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#ffffff">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Logic Router</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<style>
+:root{
+  --bg:#f6f7f9; --surface:#fff; --border:#e2e6ec; --text:#111827; --muted:#6b7280;
+  --accent:#2563eb; --accent-soft:#eff6ff; --ok:#059669; --warn:#b45309; --err:#dc2626;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;min-height:100vh;padding-bottom:calc(72px + env(safe-area-inset-bottom))}
+.app{max-width:600px;margin:0 auto;padding:20px 16px 0}
+header{display:flex;align-items:center;gap:10px;margin-bottom:22px}
+.mark{width:30px;height:30px;border:1px solid var(--border);border-radius:6px;background:var(--surface);display:grid;place-items:center;font-size:11px;font-weight:700;letter-spacing:-.3px}
+h1{font-size:16px;font-weight:600;margin:0;letter-spacing:-.2px}
+.sub{color:var(--muted);font-size:12px;margin-top:1px}
+.badge{margin-left:auto;font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);border:1px solid var(--border);border-radius:4px;padding:3px 7px;background:var(--surface)}
+section{display:none}
+section.active{display:block}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:12px}
+.field{margin-bottom:14px}
+.field:last-child{margin-bottom:0}
+.label{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px}
+.value{display:flex;align-items:center;gap:8px;border:1px solid var(--border);border-radius:6px;padding:9px 11px;background:#fafbfc}
+.value code{flex:1;min-width:0;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);border:1px solid var(--border);border-radius:10px;background:var(--surface);overflow:hidden;margin-bottom:12px}
+.stat{padding:14px 10px;text-align:center;border-right:1px solid var(--border)}
+.stat:last-child{border-right:0}
+.stat b{display:block;font-size:20px;font-weight:600}
+.stat span{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+h2{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin:20px 2px 8px}
+button{font:inherit;color:var(--text);background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:9px 13px;min-height:40px;cursor:pointer}
+button:hover{border-color:#b9c2cf}
+button:active{background:#f3f4f6}
+button:disabled{opacity:.45;cursor:not-allowed}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.primary:hover{background:#1d4ed8}
+button.danger{color:var(--err)}
+button.text{border:0;background:none;min-height:32px;padding:5px 8px;color:var(--muted)}
+button.text:hover{background:#f3f4f6;color:var(--text)}
+button.wide{width:100%}
+input,select{font:inherit;color:var(--text);background:#fff;border:1px solid var(--border);border-radius:6px;padding:10px 11px;width:100%;outline:none;min-height:42px}
+input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-soft)}
+input[type=password]{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.hint{font-size:11px;color:var(--muted);margin-top:7px}
+.err{color:var(--err);font-size:12px;margin-top:7px;min-height:16px}
+.chips{display:flex;gap:6px;overflow-x:auto;padding-bottom:6px;margin-bottom:10px;scrollbar-width:none}
+.chips::-webkit-scrollbar{display:none}
+.chip{flex:none;min-height:34px;padding:6px 11px;font-size:12px;border-radius:99px;white-space:nowrap}
+.chip.sel{border-color:var(--accent);background:var(--accent-soft);color:var(--accent)}
+.keycard{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:13px;margin-bottom:9px}
+.keyhead{display:flex;align-items:center;gap:8px}
+.keyhead b{font-size:13px;font-weight:600}
+.spacer{flex:1}
+.pill{font-size:10px;padding:2px 7px;border-radius:4px;border:1px solid var(--border);color:var(--muted)}
+.pill.on{color:var(--ok);border-color:#a7dfc9}
+.pill.off{color:var(--err);border-color:#f3b8bd}
+.pill.cool{color:var(--warn);border-color:#e9cf9c}
+.small{font-size:11px;color:var(--muted)}
+.bar{height:4px;background:#eef0f3;border-radius:2px;overflow:hidden;margin-top:8px}
+.bar i{display:block;height:100%;background:var(--ok)}
+.bar.w i{background:var(--warn)}
+.actions{display:flex;gap:4px;margin-top:10px;flex-wrap:wrap}
+.empty{text-align:center;padding:28px 12px;color:var(--muted);border:1px dashed var(--border);border-radius:8px}
+.chatbox{display:flex;flex-direction:column;gap:9px;min-height:240px;max-height:48vh;overflow:auto;padding-right:2px}
+.msg{max-width:88%;padding:9px 12px;border:1px solid var(--border);border-radius:8px;font-size:13px;white-space:pre-wrap;word-break:break-word;background:var(--surface)}
+.msg.user{align-self:flex-end;background:var(--accent-soft);border-color:#cfe0ff}
+.msg.bot{align-self:flex-start;background:#fafbfc}
+.msg.meta{align-self:center;border:0;background:none;color:var(--muted);font-size:11px;padding:2px}
+.composer{display:flex;gap:8px;margin-top:12px}
+.composer input{flex:1}
+.log{display:flex;align-items:center;gap:9px;font-size:12px;padding:8px 2px;border-bottom:1px solid var(--border)}
+.log:last-child{border-bottom:0}
+.tag{font-size:10px;padding:2px 6px;border-radius:4px;background:#e8f6f0;color:var(--ok)}
+.tag.fail{background:#fdecef;color:var(--err)}
+.log time{margin-left:auto;color:var(--muted);font-size:11px}
+nav{position:fixed;bottom:0;left:0;right:0;background:rgba(255,255,255,.96);border-top:1px solid var(--border);display:flex;justify-content:space-around;padding:6px 8px calc(6px + env(safe-area-inset-bottom));z-index:10}
+nav button{border:0;background:none;box-shadow:none;color:var(--muted);font-size:11px;min-width:70px;min-height:46px;border-radius:6px;padding:6px}
+nav button:hover{background:#f3f4f6}
+nav button.on{color:var(--accent);background:var(--accent-soft)}
+#toast{position:fixed;left:50%;bottom:88px;transform:translate(-50%,8px);background:var(--text);color:#fff;padding:9px 15px;border-radius:6px;font-size:12px;opacity:0;pointer-events:none;transition:.18s;z-index:20;max-width:88%;text-align:center}
+#toast.show{opacity:1;transform:translate(-50%,0)}
+#toast.bad{background:var(--err)}
+a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="app">
+<header>
+  <div class="mark">LR</div>
+  <div><h1>Logic Router</h1><div class="sub">Local free-tier LLM router</div></div>
+  <div class="badge">local</div>
+</header>
+
+<section id="tab-home" class="active">
+  <div class="card">
+    <div class="field"><span class="label">Endpoint</span><div class="value"><code id="endpoint">…</code><button class="text" onclick="cp('endpoint')">Copy</button></div></div>
+    <div class="field"><span class="label">API key</span><div class="value"><code id="token">…</code><button class="text" onclick="cp('token')">Copy</button></div></div>
+    <div class="hint">Use the endpoint as <b>OPENAI_BASE_URL</b> and the key as <b>OPENAI_API_KEY</b>.</div>
+  </div>
+  <div class="stats">
+    <div class="stat"><b id="s-keys">0</b><span>Active keys</span></div>
+    <div class="stat"><b id="s-req">0</b><span>Requests</span></div>
+    <div class="stat"><b id="s-fail">0</b><span>Failures</span></div>
+  </div>
+  <h2>Setup</h2>
+  <div class="card"><div class="small" style="margin-bottom:12px">Add a free provider key. Requests use <b>auto</b> and route to a working provider; a rate-limited key is cooled down and skipped.</div><button class="primary wide" onclick="go('keys')">Add a key</button></div>
+  <h2>Test</h2>
+  <div class="card"><button class="wide" onclick="go('chat')">Open quick chat</button></div>
+</section>
+
+<section id="tab-keys">
+  <h2>Add provider</h2>
+  <div class="card">
+    <div class="chips" id="chips"></div>
+    <input id="key" type="password" placeholder="API key" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <div class="hint" id="hint"></div>
+    <div class="err" id="addErr"></div>
+    <button class="primary wide" id="addBtn" onclick="addKey()">Add key</button>
+  </div>
+  <h2>Keys <span id="keyCount" class="pill">0</span></h2>
+  <div id="keys"></div>
+</section>
+
+<section id="tab-chat">
+  <div class="card">
+    <div class="row" style="display:flex;gap:8px;align-items:center"><select id="model" style="flex:1"><option value="auto">auto — any available model</option></select><button class="text" onclick="clearChat()">Clear</button></div>
+    <div class="chatbox" id="chat"><div class="msg meta">Ask anything. Requests route through your configured free keys.</div></div>
+  </div>
+  <div class="composer"><input id="prompt" placeholder="Message" onkeydown="if(event.key==='Enter')sendChat()"><button class="primary" id="sendBtn" onclick="sendChat()">Send</button></div>
+  <div class="err" id="chatErr"></div>
+</section>
+
+<section id="tab-logs">
+  <h2>Activity</h2>
+  <div class="card" id="logs"></div>
+  <h2>Router</h2>
+  <div class="card"><div style="display:flex;align-items:center;gap:8px"><span class="small" style="flex:1">Local API token</span><button class="text" id="rotBtn" onclick="rotate()">Rotate</button></div><div class="hint">Rotating invalidates the old token in clients.</div></div>
+</section>
+</div>
+
+<nav>
+  <button class="on" data-tab="home" onclick="go('home')">Home</button>
+  <button data-tab="keys" onclick="go('keys')">Keys</button>
+  <button data-tab="chat" onclick="go('chat')">Chat</button>
+  <button data-tab="logs" onclick="go('logs')">Logs</button>
+</nav>
+<div id="toast"></div>
+
+<script>
+let TOKEN='__TOKEN__';
+const H=()=>({'Content-Type':'application/json','Authorization':'Bearer '+TOKEN});
+let catalog={},selectedProvider='groq',streaming=false;
+const $=id=>document.getElementById(id);
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function toast(msg,bad){const t=$('toast');t.textContent=msg;t.className='show'+(bad?' bad':'');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',2600);}
+function go(tab){document.querySelectorAll('section').forEach(s=>s.classList.toggle('active',s.id==='tab-'+tab));document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.tab===tab));window.scrollTo({top:0,behavior:'smooth'});}
+async function copyText(txt){try{await navigator.clipboard.writeText(txt);}catch(e){const ta=document.createElement('textarea');ta.value=txt;ta.style.position='fixed';document.body.appendChild(ta);ta.select();try{document.execCommand('copy')}catch{}ta.remove();}toast('Copied');}
+function cp(id){copyText($(id).textContent.trim());}
+async function api(url,opts={}){const r=await fetch(url,{...opts,headers:{...H(),...(opts.headers||{})}});let d;try{d=await r.json();}catch{d={error:{message:'HTTP '+r.status}};}if(!r.ok)throw new Error(d.error?.message||d.error||('HTTP '+r.status));return d;}
+function pick(id){selectedProvider=id;document.querySelectorAll('.chip').forEach(c=>c.classList.toggle('sel',c.dataset.p===id));const p=catalog[id];$('hint').textContent=p?`Get a key at ${p.keyHint} · ${p.rpm?p.rpm+' RPM':'dynamic'}${p.rpd?' · '+p.rpd+'/day':p.rph?' · '+p.rph+'/hour':' · no published daily cap'}`:'Enter baseUrl|key for any OpenAI-compatible endpoint';$('addErr').textContent='';}
+function renderChips(){const box=$('chips');if(box.children.length)return;for(const [id,p] of Object.entries(catalog)){const b=document.createElement('button');b.className='chip';b.dataset.p=id;b.textContent=p.name;b.onclick=()=>pick(id);box.appendChild(b);}const c=document.createElement('button');c.className='chip';c.dataset.p='custom';c.textContent='Custom URL';c.onclick=()=>pick('custom');box.appendChild(c);pick('groq');}
+function renderModels(){const sel=$('model');if(sel.options.length>1)return;for(const m of [...new Set(Object.values(catalog).flatMap(p=>p.models))]){const o=document.createElement('option');o.value=m;o.textContent=m;sel.appendChild(o);}}
+function renderKeys(keys){$('keyCount').textContent=keys.length;const box=$('keys');if(!keys.length){box.innerHTML='<div class="empty">No keys configured. Add a free provider to start routing.</div>';return;}box.innerHTML=keys.map(k=>{const p=catalog[k.provider];const name=p?p.name:(k.label?esc(k.label.replace(/^https?:\/\//,'')):'Custom');const r1=p&&p.rpm?Math.min(100,Math.round(k.rpm/p.rpm*100)):0;const r2=p&&p.rpd?Math.min(100,Math.round(k.rpd/p.rpd*100)):0;return `<div class="keycard"><div class="keyhead"><b>${esc(name)}</b><span class="pill ${k.enabled?'on':'off'}">${k.enabled?'active':'paused'}</span>${k.cooling>0?`<span class="pill cool">${Math.ceil(k.cooling/1000)}s</span>`:''}<span class="spacer"></span><span class="small">${esc(k.masked)}</span></div><div class="small" style="margin-top:7px">${k.rpm}/min${p&&p.rpm?' of '+p.rpm:''} · ${k.rpd} today${p&&p.rpd?' of '+p.rpd:''} · ${k.fails} failures</div>${p&&p.rpm?`<div class="bar"><i style="width:${r1}%"></i></div>`:''}${p&&p.rpd?`<div class="bar w"><i style="width:${r2}%"></i></div>`:''}${k.lastError?`<div class="small" style="color:var(--err);margin-top:6px">last error ${esc(k.lastError.slice(11,19))}</div>`:''}<div class="actions"><button class="text" onclick="act('${k.id}','${k.enabled?'enabled:false':'enabled:true'}')">${k.enabled?'Pause':'Enable'}</button>${k.cooling>0?`<button class="text" onclick="act('${k.id}','uncool')">Clear cooldown</button>`:''}<button class="text danger" data-c="0" onclick="del(this,'${k.id}')">Remove</button></div></div>`;}).join('');}
+function renderLogs(log){$('logs').innerHTML=log.length?log.map(l=>`<div class="log"><span class="tag ${l.kind==='ok'?'':'fail'}">${esc(l.kind)}</span><span>${esc(l.provider||'')} ${esc(l.model||'')}${l.status?' · '+l.status:''}</span><time>${esc((l.t||'').slice(11,19))}</time></div>`).join(''):'<div class="small">No requests yet.</div>';}
+async function refresh(){try{const s=await api('/api/status');$('endpoint').textContent=s.endpoint;$('token').textContent=s.token;catalog=s.catalog;renderChips();renderModels();renderKeys(s.keys);renderLogs(s.log);$('s-keys').textContent=s.keys.filter(k=>k.enabled).length;$('s-req').textContent=s.keys.reduce((a,k)=>a+k.rpd,0);$('s-fail').textContent=s.keys.reduce((a,k)=>a+k.fails,0);}catch(e){toast('Status: '+e.message,true);}}
+async function addKey(){const key=$('key').value.trim();if(!key){$('addErr').textContent='Paste a key first';return;}let body={provider:selectedProvider,key,label:''};if(selectedProvider==='custom'){const i=key.indexOf('|');if(i<1){$('addErr').textContent='Use baseUrl|key';return;}body.label=key.slice(0,i).trim();body.key=key.slice(i+1).trim();}const btn=$('addBtn');btn.disabled=true;btn.textContent='Adding…';$('addErr').textContent='';try{await api('/api/keys',{method:'POST',body:JSON.stringify(body)});$('key').value='';toast('Key added');await refresh();}catch(e){$('addErr').textContent=e.message;}finally{btn.disabled=false;btn.textContent='Add key';}}
+async function act(id,what){const body=what.startsWith('enabled:')?{enabled:what.endsWith('true')}:{cooldownUntil:0};try{await api('/api/keys/'+id,{method:'PATCH',body:JSON.stringify(body)});await refresh();toast('Updated');}catch(e){toast(e.message,true);}}
+function del(btn,id){if(btn.dataset.c==='1'){api('/api/keys/'+id,{method:'DELETE'}).then(()=>{toast('Key removed');refresh();}).catch(e=>toast(e.message,true));return;}btn.dataset.c='1';btn.textContent='Confirm';setTimeout(()=>{if(btn.isConnected){btn.dataset.c='0';btn.textContent='Remove';}},2500);}
+let rotArmed=false;function rotate(){if(!rotArmed){rotArmed=true;$('rotBtn').textContent='Confirm';setTimeout(()=>{rotArmed=false;$('rotBtn').textContent='Rotate';},2500);return;}rotArmed=false;$('rotBtn').textContent='Rotate';api('/api/token',{method:'POST',body:'{}'}).then(j=>{TOKEN=j.token;toast('Token rotated');refresh();}).catch(e=>toast(e.message,true));}
+function msg(text,who){const d=document.createElement('div');d.className='msg '+who;d.textContent=text;$('chat').appendChild(d);$('chat').scrollTop=$('chat').scrollHeight;return d;}
+function clearChat(){$('chat').innerHTML='<div class="msg meta">Ask anything. Requests route through your configured free keys.</div>';}
+async function sendChat(){if(streaming)return;const text=$('prompt').value.trim();if(!text)return;$('prompt').value='';$('chatErr').textContent='';msg(text,'user');const out=msg('','bot');const btn=$('sendBtn');btn.disabled=true;btn.textContent='…';streaming=true;try{const r=await fetch('/v1/chat/completions',{method:'POST',headers:H(),body:JSON.stringify({model:$('model').value,messages:[{role:'user',content:text}],stream:true})});if(!r.ok){const j=await r.json();throw new Error(j.error?.message||'HTTP '+r.status);}const reader=r.body.getReader(),dec=new TextDecoder();let buf='';for(;;){const {done,value}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;while((i=buf.indexOf('\n'))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+1);if(!line.startsWith('data: '))continue;const d=line.slice(6);if(d==='[DONE]')continue;try{const j=JSON.parse(d);const t=j.choices?.[0]?.delta?.content;if(t)out.textContent+=t;}catch{}}}if(!out.textContent)out.textContent='No content returned.';refresh();}catch(e){out.textContent='Error: '+e.message;$('chatErr').textContent=e.message;}finally{streaming=false;btn.disabled=false;btn.textContent='Send';}}
+refresh();setInterval(()=>{if(!streaming&&!['INPUT','TEXTAREA'].includes(document.activeElement?.tagName))refresh();},5000);
+</script>
+</body>
+</html>
