@@ -5,7 +5,8 @@
   "description": "Minimal local router for free LLM API tiers, built for Android/Termux.",
   "bin": { "logic-router": "server.js" },
   "scripts": {
-    "start": "node server.js"
+    "start": "node supervisor.js",
+    "serve": "node server.js"
   },
   "engines": { "node": ">=20" },
   "dependencies": {},

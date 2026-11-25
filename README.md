@@ -1,6 +1,6 @@
 # Logic Router
 
-A minimal, dependency-free local router for free LLM API tiers. Built for Android/Termux. One OpenAI-compatible endpoint, a small web dashboard, automatic failover on 429/5xx, and no hosted intermediary.
+A minimal, dependency-free local router for free LLM API tiers. Built for Android/Termux. One OpenAI-compatible endpoint, a small web dashboard, automatic failover, bounded concurrency, circuit breakers, and a supervisor that restarts crashes.
 
 No gradients, no sample data, no trial credits. Keys stay on the device.
 
@@ -10,10 +10,36 @@ No gradients, no sample data, no trial credits. Keys stay on the device.
 pkg install -y nodejs
 git clone https://github.com/logicfracture01/logic-router.git
 cd logic-router
-node server.js
+npm start
 ```
 
+`npm start` runs `supervisor.js`, which starts the server, probes `/health` every 5 seconds, and restarts it after a crash, hang, or repeated failed probes. Use `npm run serve` for the bare server without supervision.
+
 Open `http://127.0.0.1:20129/`. The local token is printed in the terminal and shown in the dashboard. The server binds to `127.0.0.1` only.
+
+## Load and recovery behavior
+
+- **Bounded concurrency:** at most `MAX_INFLIGHT` (64) upstream calls run at once; up to `MAX_QUEUE` (256) wait in a FIFO queue. Excess requests get `503` with `Retry-After` instead of exhausting memory.
+- **Adaptive limit:** the effective concurrency shrinks on upstream failures and recovers on successes.
+- **Per-key cap:** no single key exceeds `KEY_INFLIGHT` (4) concurrent requests.
+- **Circuit breaker:** after `BREAKER_THRESHOLD` (3) failures a key is opened with exponential backoff and jitter; one half-open probe tests recovery. `Retry-After` from the provider is honored.
+- **Timeouts:** upstream calls abort after `UPSTREAM_TIMEOUT_MS` (120s), queued requests after `QUEUE_TIMEOUT_MS` (30s), and stalled streams are cut after `STREAM_IDLE_MS` (30s).
+- **Retries:** transient network errors and HTTP 5xx retry up to `MAX_RETRIES` (1) with jitter before rotating to the next key.
+- **State safety:** state is written atomically via temp file + rename; a corrupt state file is quarantined and a fresh one is created.
+- **Self-healing:** uncaught exceptions close and re-open the listener in-process. The supervisor provides the outer crash-restart loop with exponential backoff (up to 30s, 60s after 10 restarts in 10 minutes).
+- **Observability:** `GET /health` (no auth) for supervision; `GET /api/metrics` (auth) for counters, latency percentiles, per-provider stats, and system events.
+
+Tune via environment variables, for example:
+
+```sh
+MAX_INFLIGHT=128 MAX_QUEUE=512 KEY_INFLIGHT=8 npm start
+```
+
+Quick load probe (writes nothing):
+
+```sh
+node tools/loadtest.js 400 60
+```
 
 ## Setup
 
@@ -50,17 +76,12 @@ curl http://127.0.0.1:20129/v1/chat/completions \
 
 Model IDs: `auto`, aliases `fast` / `smart` / `coder` / `free`, or an exact free model ID. Streaming is supported.
 
-## Behavior
-
-- A 429 puts the key in cooldown using the upstream `Retry-After`; the next key takes over.
-- Per-key RPM/RPD counters are tracked against published free-tier caps.
-- 401/403 keys are skipped immediately and reported in the activity log.
-- State is stored in `state.json` (mode 0600, gitignored).
-
 ## Files
 
-- `server.js` — HTTP server, provider catalog, routing, cooldowns, `/v1` API.
+- `server.js` — server, provider catalog, routing, queue, breakers, metrics.
+- `supervisor.js` — health probes and crash/hang restarts.
 - `public/index.html` — single-file dashboard.
-- `public/manifest.webmanifest` — installable PWA metadata.
+- `tools/loadtest.js` — dependency-free load probe.
+- `state.json` — runtime state (gitignored, mode 0600).
 
-Total source is under 50 KB with zero npm dependencies.
+Zero npm dependencies, under 60 KB of source.
