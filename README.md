@@ -41,6 +41,25 @@ Quick load probe (writes nothing):
 node tools/loadtest.js 400 60
 ```
 
+## Teammates and shared capacity
+
+The pool is shared, the keys are private. Every teammate gets their own bearer token and two models.
+
+- **Roles:** the admin token is printed at startup. Admin creates users in the **Admin** tab (or `POST /api/users`), sets each user's `rpmLimit` / `rpdLimit`, and can rotate or revoke their tokens. Only the admin can see the user list, `/api/metrics`, `/api/config` and `/api/billing`.
+- **Privacy:** a user can fully manage only their own keys (add, pause, remove, clear cooldown). `/api/status` returns only their keys, with masked values — key strings are never exposed by any API. Cross-user key operations return `404`; admin endpoints return `403`.
+- **Shared free pool:** all keys with tier `free` form one pool. Requests from any user can use any healthy free key, so combined capacity is the sum of everyone's contributions. Each user is capped by their own RPM/RPD quota (e.g. friend1 60 RPM, teammate97 150 RPM).
+- **Exact-per-key safety:** per-key RPM/RPD caps from the provider catalog are still enforced, so a key is never driven past its published free tier.
+- **Two models per user:** `auto` routes to the free pool; `paid` routes only to keys the admin tagged `paid`, and every paid request is logged per user in `/api/billing` (requests, tokens, estimated cost) for later settlement. Non-admin users get `403` if they request any other model ID.
+- **Smart local routing:** `auto` classifies the prompt locally (code, reasoning, vision, bulk/cheap, general) and ranks available free keys by capability for that task, then by health and remaining quota. Classification is returned in `x-logic-router-task`. No extra API call is made and prompts are not sent anywhere for classification.
+- **Quota errors:** exceeding a personal quota returns `429` with `Retry-After`, counted separately from provider rate limits.
+
+Each teammate connects with:
+
+```sh
+export OPENAI_BASE_URL=http://127.0.0.1:20129/v1
+export OPENAI_API_KEY=<their token>
+```
+
 ## Cache and usage monitoring
 
 - **Response cache:** identical non-streaming requests are cached in memory (default 10 min TTL, 500 entries, 512 KB per entry). Cache hits return instantly with `x-logic-router-cache: HIT`. Set `"cache": false` or `"cache_control": {"type": "no-cache"}` in a request to bypass it.

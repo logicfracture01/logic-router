@@ -52,41 +52,64 @@ const USAGE_RATES = { // approximate list-price USD per 1M tokens, for "value sa
   meganova: { in: 0.3, out: 1 }, kilo: { in: 0.3, out: 1 }, freeinference: { in: 0.3, out: 1 },
   radeon: { in: 0.3, out: 1 }, custom: { in: 0, out: 0 },
 };
-function freshUsage() { return { days: {}, providers: {} }; }
+const PAID_RATE_IN = Number(process.env.PAID_RATE_IN || 2);   // USD per 1M input tokens (estimate only)
+const PAID_RATE_OUT = Number(process.env.PAID_RATE_OUT || 8);  // USD per 1M output tokens (estimate only)
+function freshUsage() { return { days: {}, providers: {}, users: {} }; }
+function freshUserUsage() { return { days: {}, providers: {}, paid: { requests: 0, tokensIn: 0, tokensOut: 0, estCost: 0 } }; }
 const today = () => new Date().toISOString().slice(0, 10);
-function usageBucket() {
+function usageBucket(store) {
   const d = today();
-  return state.usage.days[d] || (state.usage.days[d] = { requests: 0, ok: 0, fail: 0, tokensIn: 0, tokensOut: 0, estSaved: 0, cached: 0 });
+  return store.days[d] || (store.days[d] = { requests: 0, ok: 0, fail: 0, tokensIn: 0, tokensOut: 0, estSaved: 0, cached: 0 });
 }
-function recordUsage(provider, ok, usage) {
+function userUsage(id) {
   if (!state.usage) state.usage = freshUsage();
-  const d = usageBucket();
+  if (!state.usage.users) state.usage.users = {};
+  return state.usage.users[id] || (state.usage.users[id] = freshUserUsage());
+}
+function bumpUsage(store, provider, ok, tin, tout, saved) {
+  const d = usageBucket(store);
+  d.requests++; if (ok) d.ok++; else d.fail++;
+  d.tokensIn += tin; d.tokensOut += tout; d.estSaved += saved;
+  const pp = store.providers[provider] || (store.providers[provider] = { requests: 0, ok: 0, fail: 0, tokensIn: 0, tokensOut: 0, estSaved: 0 });
+  pp.requests++; if (ok) pp.ok++; else pp.fail++;
+  pp.tokensIn += tin; pp.tokensOut += tout; pp.estSaved += saved;
+  const keys = Object.keys(store.days).sort();
+  while (keys.length > 30) delete store.days[keys.shift()];
+}
+function recordUsage(actorId, provider, ok, usage, paid) {
+  if (!state.usage) state.usage = freshUsage();
   const tin = Math.max(0, Number(usage && usage.prompt_tokens) || 0);
   const tout = Math.max(0, Number(usage && usage.completion_tokens) || 0);
   const rate = USAGE_RATES[provider] || USAGE_RATES.custom;
   const saved = (tin * rate.in + tout * rate.out) / 1e6;
-  d.requests++; if (ok) d.ok++; else d.fail++;
-  d.tokensIn += tin; d.tokensOut += tout; d.estSaved += saved;
-  const pp = state.usage.providers[provider] || (state.usage.providers[provider] = { requests: 0, ok: 0, fail: 0, tokensIn: 0, tokensOut: 0, estSaved: 0 });
-  pp.requests++; if (ok) pp.ok++; else pp.fail++;
-  pp.tokensIn += tin; pp.tokensOut += tout; pp.estSaved += saved;
-  const keys = Object.keys(state.usage.days).sort();
-  while (keys.length > 30) delete state.usage.days[keys.shift()];
+  bumpUsage(state.usage, provider, ok, tin, tout, saved);
+  const uu = userUsage(actorId);
+  bumpUsage(uu, provider, ok, tin, tout, saved);
+  if (paid) {
+    uu.paid.requests++; uu.paid.tokensIn += tin; uu.paid.tokensOut += tout;
+    uu.paid.estCost += (tin * PAID_RATE_IN + tout * PAID_RATE_OUT) / 1e6;
+  }
   persist();
 }
-function recordCacheHit(entry) {
+function recordCacheHit(entry, actorId, paid) {
   if (!state.usage) state.usage = freshUsage();
-  const d = usageBucket();
-  d.cached++;
+  usageBucket(state.usage).cached++;
   const rate = USAGE_RATES[entry.provider] || USAGE_RATES.custom;
-  d.estSaved += ((entry.tokensIn || 0) * rate.in + (entry.tokensOut || 0) * rate.out) / 1e6;
+  usageBucket(state.usage).estSaved += ((entry.tokensIn || 0) * rate.in + (entry.tokensOut || 0) * rate.out) / 1e6;
+  const uu = userUsage(actorId);
+  usageBucket(uu).cached++;
+  if (paid) {
+    uu.paid.requests++;
+    uu.paid.tokensIn += entry.tokensIn || 0; uu.paid.tokensOut += entry.tokensOut || 0;
+    uu.paid.estCost += ((entry.tokensIn || 0) * PAID_RATE_IN + (entry.tokensOut || 0) * PAID_RATE_OUT) / 1e6;
+  }
   persist();
 }
 function cacheKey(model, body) {
   const material = JSON.stringify({ model, messages: body.messages, temperature: body.temperature, top_p: body.top_p, max_tokens: body.max_tokens, tools: body.tools, response_format: body.response_format });
   return crypto.createHash('sha256').update(material).digest('hex');
 }
-function cacheGet(key) {
+function cacheGet(key, actorId, paid) {
   const e = cache.get(key);
   if (!e) { cacheStats.misses++; return null; }
   if (Date.now() - e.stored > CACHE_TTL) {
@@ -98,7 +121,7 @@ function cacheGet(key) {
   cacheStats.hits++;
   cache.delete(key); cache.set(key, e);
   cacheStats.savedTokens += (e.tokensIn || 0) + (e.tokensOut || 0);
-  recordCacheHit(e);
+  recordCacheHit(e, actorId, paid);
   return e;
 }
 function cacheGetStale(key) {
@@ -162,7 +185,8 @@ const ALIASES = { auto: null, free: 'openrouter/free', fast: 'openai/gpt-oss-120
 // ---------------------------------------------------------------------------
 // State — atomic writes + corruption recovery
 // ---------------------------------------------------------------------------
-function freshState() { return { token: crypto.randomBytes(18).toString('base64url'), keys: [], log: [] }; }
+function freshState() { return { token: crypto.randomBytes(18).toString('base64url'), users: [], keys: [], log: [], usage: freshUsage() }; }
+function freshUserCounters() { const n = Date.now(); return { minStamp: Math.floor(n / 60000), min: 0, dayStamp: new Date(n).toISOString().slice(0, 10), day: 0 }; }
 function freshCounters() {
   const n = Date.now();
   return { minStamp: Math.floor(n / 60000), min: 0, hourStamp: Math.floor(n / 3600000), hour: 0, dayStamp: new Date(n).toISOString().slice(0, 10), day: 0 };
@@ -182,16 +206,26 @@ try {
   state = freshState();
 }
 if (!Array.isArray(state.keys)) state.keys = [];
+if (!Array.isArray(state.users)) state.users = [];
 if (!Array.isArray(state.log)) state.log = [];
 if (!state.usage || typeof state.usage !== 'object') state.usage = freshUsage();
 if (!state.usage.days) state.usage.days = {};
 if (!state.usage.providers) state.usage.providers = {};
+if (!state.usage.users) state.usage.users = {};
+for (const u of state.users) {
+  if (!u.counters) u.counters = freshUserCounters();
+  if (u.rpmLimit == null) u.rpmLimit = 60;
+  if (u.rpdLimit == null) u.rpdLimit = 2000;
+  if (u.enabled == null) u.enabled = true;
+}
 for (const k of state.keys) {
   if (!k.requests) k.requests = freshCounters();
   if (!k.cb) k.cb = freshBreaker();
   if (k.cooldownUntil == null) k.cooldownUntil = 0;
   if (k.fails == null) k.fails = 0;
   if (k.enabled == null) k.enabled = true;
+  if (!k.ownerId) k.ownerId = 'admin';
+  if (!k.tier) k.tier = 'free';
   k.inflight = 0;
 }
 
@@ -333,12 +367,47 @@ function parseRetryAfter(res) {
   return Number.isFinite(n) ? n * 1000 : Math.max(0, Date.parse(h) - Date.now()) || 30000;
 }
 
-function candidatesFor(model) {
+// Local, zero-call task classifier. Scores are relative preferences, not facts.
+const CAPS = {
+  groq: { code: 0.8, reason: 0.6, vision: 0.2, cheap: 0.7, general: 0.8, speed: 1 },
+  gemini: { code: 0.85, reason: 0.95, vision: 0.9, cheap: 0.6, general: 0.9, speed: 0.6 },
+  openrouter: { code: 0.7, reason: 0.75, vision: 0.7, cheap: 0.6, general: 0.75, speed: 0.5 },
+  tokenharbor: { code: 0.75, reason: 0.8, vision: 0.3, cheap: 0.7, general: 0.75, speed: 0.7 },
+  opentyphoon: { code: 0.5, reason: 0.5, vision: 0.2, cheap: 0.8, general: 0.6, speed: 0.8 },
+  requesty: { code: 0.7, reason: 0.7, vision: 0.5, cheap: 0.7, general: 0.7, speed: 0.6 },
+  meganova: { code: 0.65, reason: 0.6, vision: 0.3, cheap: 0.7, general: 0.7, speed: 0.7 },
+  kilo: { code: 0.7, reason: 0.7, vision: 0.6, cheap: 0.7, general: 0.7, speed: 0.6 },
+  freeinference: { code: 0.9, reason: 0.9, vision: 0.3, cheap: 0.6, general: 0.8, speed: 0.6 },
+  radeon: { code: 0.85, reason: 0.8, vision: 0.5, cheap: 0.6, general: 0.8, speed: 0.7 },
+  custom: { code: 0.5, reason: 0.5, vision: 0.5, cheap: 0.5, general: 0.5, speed: 0.7 },
+};
+function taskOf(messages) {
+  const text = (messages || []).map((m) => {
+    if (Array.isArray(m.content)) return m.content.map((p) => p && p.type === 'text' ? (p.text || '') : '[image]').join(' ');
+    return typeof m.content === 'string' ? m.content : '';
+  }).join(' ').toLowerCase();
+  if (/\[image\]|image_url|data:image|ocr|screenshot|vision/.test(text)) return 'vision';
+  if (/```|\b(code|bug|function|refactor|compile|regex|python|javascript|typescript|typescript|git|stack trace|unit test|debug)\b/.test(text)) return 'code';
+  if (/\b(why|prove|reason|analyze|trade-?off|architecture|deep|step by step|derive|compare|evaluate)\b/.test(text)) return 'reason';
+  if (/\b(summarize|translate|rewrite|extract|list|short|brief| classify|tweet)\b/.test(text)) return 'cheap';
+  return 'general';
+}
+function taskScore(c, task) {
+  const caps = CAPS[c.key.provider] || CAPS.custom;
+  let s = (caps[task] || 0.5) * 2 + (caps.general || 0.5) * 0.3;
+  if (c.key.cb && c.key.cb.state === 'half') s -= 0.4;
+  s -= Math.min(0.4, c.key.fails * 0.1);
+  s -= Math.min(0.3, (c.key.requests.day / Math.max(1, c.provider.rpd || 1000)) * 0.3);
+  return s;
+}
+function candidatesFor(model, task) {
   const alias = ALIASES[model];
   const target = alias === undefined ? model : alias;
+  const tier = model === 'paid' ? 'paid' : 'free';
   const now = Date.now();
   const out = [];
   for (const k of state.keys) {
+    if (k.tier !== tier) continue;
     const p = resolveProvider(k);
     if (!p || !keyUsable(k, p, now)) continue;
     if (target && p.models.length && !p.models.includes(target)) continue;
@@ -346,6 +415,10 @@ function candidatesFor(model) {
     out.push({ key: k, provider: p, model: target || p.models[0] || 'gpt-4o-mini' });
   }
   out.sort((a, b) => {
+    if (task && target == null) {
+      const d = taskScore(b, task) - taskScore(a, task);
+      if (Math.abs(d) > 0.01) return d;
+    }
     const sa = a.key.cb.state === 'half' ? -1 : 0;
     const sb = b.key.cb.state === 'half' ? -1 : 0;
     if (sa !== sb) return sa - sb;
@@ -357,15 +430,17 @@ function candidatesFor(model) {
   return out;
 }
 
-async function waitForCandidate(model, timeout) {
+async function waitForCandidate(model, task, timeout) {
   const alias = ALIASES[model];
   const target = alias === undefined ? model : alias;
+  const tier = model === 'paid' ? 'paid' : 'free';
   const deadline = Date.now() + Math.min(timeout, 10000);
   for (;;) {
-    const ready = candidatesFor(model);
+    const ready = candidatesFor(model, task);
     if (ready.length) return ready;
     const now = Date.now();
     const possible = state.keys.some((k) => {
+      if (k.tier !== tier) return false;
       const p = resolveProvider(k);
       if (!p || !keyUsable(k, p, now, true)) return false;
       return !target || !p.models.length || p.models.includes(target);
@@ -423,8 +498,42 @@ function readBody(req, limit) {
     req.on('error', (e) => { if (!tooLarge) reject(e); });
   });
 }
-function authorized(req) {
-  return (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim() === state.token;
+function tokenOf(req) { return (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim(); }
+function authOf(req) {
+  const t = tokenOf(req);
+  if (!t) return null;
+  if (t === state.token) return { admin: true, id: 'admin', user: null };
+  const u = state.users.find((x) => x.token === t && x.enabled !== false);
+  return u ? { admin: false, id: u.id, user: u } : null;
+}
+function quotaCheck(auth) {
+  if (auth.admin) return null;
+  const u = auth.user, r = u.counters;
+  const now = Date.now();
+  const minStamp = Math.floor(now / 60000), dayStamp = new Date(now).toISOString().slice(0, 10);
+  if (r.minStamp !== minStamp) { r.minStamp = minStamp; r.min = 0; }
+  if (r.dayStamp !== dayStamp) { r.dayStamp = dayStamp; r.day = 0; }
+  const rpm = Math.max(1, Number(u.rpmLimit) || 60), rpd = Math.max(1, Number(u.rpdLimit) || 2000);
+  if (r.min >= rpm) return { retry: 60, type: 'user_rpm_exceeded' };
+  if (r.day >= rpd) return { retry: Math.max(60, 86400 - Math.floor((now % 86400000) / 1000)), type: 'user_rpd_exceeded' };
+  r.min++; r.day++;
+  persist();
+  return null;
+}
+function keyView(k, admin) {
+  return {
+    id: k.id, ownerId: k.ownerId || 'admin', tier: k.tier || 'free', provider: k.provider,
+    label: k.label || '', enabled: k.enabled,
+    masked: String(k.key).slice(0, 4) + '…' + String(k.key).slice(-4),
+    rpm: k.requests.min, rpd: k.requests.day, fails: k.fails,
+    cooling: Math.max(0, Math.max(k.cooldownUntil, k.cb ? k.cb.openUntil : 0) - Date.now()),
+    breaker: k.cb ? k.cb.state : 'closed', lastError: k.lastError || null,
+  };
+}
+function userView(u, includeToken) {
+  const out = { id: u.id, name: u.name, rpmLimit: u.rpmLimit, rpdLimit: u.rpdLimit, enabled: u.enabled !== false, created: u.created, usedMin: u.counters.min || 0, usedDay: u.counters.day || 0, keys: state.keys.filter((k) => k.ownerId === u.id).length };
+  if (includeToken) out.token = u.token;
+  return out;
 }
 const UI_FILE = path.join(ROOT, 'public', 'index.html');
 
@@ -452,7 +561,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (p === '/' || p === '/index.html') {
       if (!fs.existsSync(UI_FILE)) return text(res, 500, 'UI file missing');
-      return text(res, 200, fs.readFileSync(UI_FILE, 'utf8').replace('__TOKEN__', state.token), 'text/html; charset=utf-8');
+      return text(res, 200, fs.readFileSync(UI_FILE, 'utf8'), 'text/html; charset=utf-8');
     }
     if (p === '/manifest.webmanifest') {
       const mf = path.join(ROOT, 'public', 'manifest.webmanifest');
@@ -460,23 +569,24 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p.startsWith('/api/')) {
-      if (!authorized(req)) return json(res, 401, { error: 'unauthorized' });
+      const auth = authOf(req);
+      if (!auth) return json(res, 401, { error: 'unauthorized' });
+      const mine = (k) => auth.admin || k.ownerId === auth.id;
       if (p === '/api/status' && req.method === 'GET') {
         return json(res, 200, {
-          endpoint: `http://${HOST}:${PORT}/v1`, token: state.token,
-          keys: state.keys.map((k) => ({
-            id: k.id, provider: k.provider, label: k.label || '', enabled: k.enabled,
-            masked: k.key.slice(0, 4) + '…' + k.key.slice(-4),
-            rpm: k.requests.min, rpd: k.requests.day, fails: k.fails,
-            cooling: Math.max(0, Math.max(k.cooldownUntil, k.cb ? k.cb.openUntil : 0) - Date.now()),
-            breaker: k.cb ? k.cb.state : 'closed', inflight: k.inflight, lastError: k.lastError || null,
-          })),
-          log: state.log.slice(0, 40), system: sysLog.slice(0, 30),
+          endpoint: `http://${HOST}:${PORT}/v1`,
+          identity: { id: auth.id, admin: auth.admin, name: auth.admin ? 'admin' : auth.user.name },
+          quota: auth.admin ? null : { rpmLimit: auth.user.rpmLimit, rpdLimit: auth.user.rpdLimit, usedMin: auth.user.counters.min, usedDay: auth.user.counters.day },
+          keys: state.keys.filter(mine).map((k) => keyView(k, auth.admin)),
+          users: auth.admin ? state.users.map((u) => userView(u, true)) : undefined,
+          log: state.log.filter((l) => auth.admin || !l.ownerId || l.ownerId === auth.id).slice(0, 40),
+          system: auth.admin ? sysLog.slice(0, 30) : undefined,
           load: { inflight, queue: waiters.length, limit: effectiveLimit(), shed: metrics.shed, queueTimeouts: metrics.queueTimeouts },
           catalog: Object.fromEntries(Object.entries(PROVIDERS).map(([id, v]) => [id, { name: v.name, rpm: v.rpm || null, rpd: v.rpd || null, models: v.models, keyHint: v.keyHint }])),
         });
       }
       if (p === '/api/metrics' && req.method === 'GET') {
+        if (!auth.admin) return json(res, 403, { error: 'admin only' });
         return json(res, 200, {
           uptime: Math.floor((Date.now() - metrics.started) / 1000),
           requests: metrics.requests, ok: metrics.ok, failed: metrics.failed, shed: metrics.shed,
@@ -489,22 +599,35 @@ const server = http.createServer(async (req, res) => {
       }
       if (p === '/api/cache' && req.method === 'GET') return json(res, 200, cacheSnapshot());
       if (p === '/api/cache/clear' && req.method === 'POST') {
+        if (!auth.admin) return json(res, 403, { error: 'admin only' });
         cache.clear(); cacheStats.bytes = 0; cacheStats.stored = 0; cacheStats.hits = 0; cacheStats.misses = 0; cacheStats.savedTokens = 0;
         slog('cache-cleared', 'manual');
         return json(res, 200, { ok: true });
       }
       if (p === '/api/usage' && req.method === 'GET') {
-        const days = Object.entries(state.usage.days).sort((a, b) => b[0].localeCompare(a[0])).slice(0, 7).map(([day, v]) => ({ day, ...v }));
+        const store = auth.admin ? state.usage : userUsage(auth.id);
+        const days = Object.entries(store.days).sort((a, b) => b[0].localeCompare(a[0])).slice(0, 7).map(([day, v]) => ({ day, ...v }));
+        const totals = days.reduce((a, d) => { for (const k of ['requests', 'ok', 'fail', 'tokensIn', 'tokensOut', 'estSaved', 'cached']) a[k] += d[k] || 0; return a; }, { requests: 0, ok: 0, fail: 0, tokensIn: 0, tokensOut: 0, estSaved: 0, cached: 0 });
         return json(res, 200, {
-          days, providers: state.usage.providers,
-          totals: days.reduce((a, d) => { for (const k of ['requests', 'ok', 'fail', 'tokensIn', 'tokensOut', 'estSaved', 'cached']) a[k] += d[k] || 0; return a; }, { requests: 0, ok: 0, fail: 0, tokensIn: 0, tokensOut: 0, estSaved: 0, cached: 0 }),
+          scope: auth.id, days, providers: store.providers, totals,
+          quota: auth.admin ? null : { rpmLimit: auth.user.rpmLimit, rpdLimit: auth.user.rpdLimit, usedMin: auth.user.counters.min, usedDay: auth.user.counters.day },
+          users: auth.admin ? state.users.map((u) => ({ id: u.id, name: u.name, paid: userUsage(u.id).paid, usedDay: u.counters.day })) : undefined,
           note: 'estSaved uses approximate list-price rates, not billed amounts.',
+        });
+      }
+      if (p === '/api/billing' && req.method === 'GET') {
+        if (!auth.admin) return json(res, 403, { error: 'admin only' });
+        return json(res, 200, {
+          rates: { in: PAID_RATE_IN, out: PAID_RATE_OUT, unit: 'USD per 1M tokens (estimate)' },
+          users: state.users.map((u) => ({ id: u.id, name: u.name, ...userUsage(u.id).paid })),
+          total: state.users.reduce((a, u) => { const p = userUsage(u.id).paid; a.requests += p.requests; a.tokensIn += p.tokensIn; a.tokensOut += p.tokensOut; a.estCost += p.estCost; return a; }, { requests: 0, tokensIn: 0, tokensOut: 0, estCost: 0 }),
         });
       }
       if (p === '/api/config' && req.method === 'GET') {
         return json(res, 200, { cacheEnabled: CACHE_ENABLED, cacheTtl: CACHE_TTL, cacheMax: CACHE_MAX, maxInflight: CFG.maxInflight, maxQueue: CFG.maxQueue, keyInflight: CFG.keyInflight, retries: CFG.retries, breakerThreshold: CFG.breakerThreshold, upstreamTimeout: CFG.upstreamTimeout });
       }
       if (p === '/api/config' && req.method === 'PATCH') {
+        if (!auth.admin) return json(res, 403, { error: 'admin only' });
         let b;
         try { b = JSON.parse(await readBody(req, 65536)); } catch { return json(res, 400, { error: 'invalid JSON' }); }
         if (!b || typeof b !== 'object' || Array.isArray(b)) return json(res, 400, { error: 'object required' });
@@ -520,19 +643,60 @@ const server = http.createServer(async (req, res) => {
         slog('config-updated', JSON.stringify(b));
         return json(res, 200, { ok: true });
       }
+      if (p === '/api/users' && req.method === 'GET') {
+        if (!auth.admin) return json(res, 403, { error: 'admin only' });
+        return json(res, 200, { users: state.users.map((u) => userView(u, true)) });
+      }
+      if (p === '/api/users' && req.method === 'POST') {
+        if (!auth.admin) return json(res, 403, { error: 'admin only' });
+        let b; try { b = JSON.parse(await readBody(req, 65536)); } catch { return json(res, 400, { error: 'invalid JSON' }); }
+        const name = String(b.name || '').trim().slice(0, 40);
+        if (!name) return json(res, 400, { error: 'name required' });
+        if (state.users.length >= 200) return json(res, 400, { error: 'user limit reached' });
+        const num = (v, f, min, max) => { const n = Number(v); return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.floor(n))) : f; };
+        const u = { id: crypto.randomUUID().slice(0, 8), name, token: crypto.randomBytes(18).toString('base64url'), rpmLimit: num(b.rpmLimit, 60, 1, 10000), rpdLimit: num(b.rpdLimit, 2000, 1, 1000000), enabled: true, created: new Date().toISOString(), counters: freshUserCounters() };
+        state.users.push(u); persistNow(); addLog({ kind: 'user-added', name: u.name, id: u.id });
+        return json(res, 200, { ok: true, user: userView(u, true) });
+      }
+      const um = p.match(/^\/api\/users\/([a-z0-9-]+)(\/token)?$/);
+      if (um) {
+        if (!auth.admin) return json(res, 403, { error: 'admin only' });
+        const u = state.users.find((x) => x.id === um[1]);
+        if (!u) return json(res, 404, { error: 'not found' });
+        if (req.method === 'DELETE') {
+          state.users = state.users.filter((x) => x !== u);
+          state.keys = state.keys.filter((k) => k.ownerId !== u.id);
+          delete state.usage.users[u.id];
+          persistNow(); return json(res, 200, { ok: true });
+        }
+        if (req.method === 'POST' && um[2]) {
+          u.token = crypto.randomBytes(18).toString('base64url');
+          persistNow(); return json(res, 200, { ok: true, token: u.token });
+        }
+        if (req.method === 'PATCH') {
+          const b = JSON.parse(await readBody(req, 65536));
+          const num = (v, f, min, max) => { const n = Number(v); return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.floor(n))) : f; };
+          if (b.rpmLimit != null) u.rpmLimit = num(b.rpmLimit, u.rpmLimit, 1, 10000);
+          if (b.rpdLimit != null) u.rpdLimit = num(b.rpdLimit, u.rpdLimit, 1, 1000000);
+          if (typeof b.enabled === 'boolean') u.enabled = b.enabled;
+          if (b.name) u.name = String(b.name).trim().slice(0, 40) || u.name;
+          persistNow(); return json(res, 200, { ok: true, user: userView(u, true) });
+        }
+      }
       if (p === '/api/keys' && req.method === 'POST') {
-        const b = JSON.parse(await readBody(req, 65536));
+        let b; try { b = JSON.parse(await readBody(req, 65536)); } catch { return json(res, 400, { error: 'invalid JSON' }); }
         if (!PROVIDERS[b.provider] && b.provider !== 'custom') return json(res, 400, { error: 'unknown provider' });
         if (!b.key || typeof b.key !== 'string' || b.key.length > 4096) return json(res, 400, { error: 'valid key required' });
-        if (state.keys.length >= 256) return json(res, 400, { error: 'key limit reached' });
-        const k = { id: crypto.randomUUID().slice(0, 8), provider: b.provider, key: b.key.trim(), label: String(b.label || '').slice(0, 120), enabled: true, cooldownUntil: 0, fails: 0, requests: freshCounters(), cb: freshBreaker(), lastError: null, inflight: 0 };
-        state.keys.push(k); persistNow(); addLog({ kind: 'key-added', provider: k.provider, id: k.id });
+        if (state.keys.length >= 1000) return json(res, 400, { error: 'key limit reached' });
+        const tier = auth.admin && b.tier === 'paid' ? 'paid' : 'free';
+        const k = { id: crypto.randomUUID().slice(0, 8), ownerId: auth.admin ? (b.ownerId || 'admin') : auth.id, tier, provider: b.provider, key: b.key.trim(), label: String(b.label || '').slice(0, 120), enabled: true, cooldownUntil: 0, fails: 0, requests: freshCounters(), cb: freshBreaker(), lastError: null, inflight: 0 };
+        state.keys.push(k); persistNow(); addLog({ kind: 'key-added', provider: k.provider, id: k.id, ownerId: k.ownerId });
         return json(res, 200, { ok: true, id: k.id });
       }
       const km = p.match(/^\/api\/keys\/([a-z0-9-]+)$/);
       if (km) {
         const k = state.keys.find((x) => x.id === km[1]);
-        if (!k) return json(res, 404, { error: 'not found' });
+        if (!k || !mine(k)) return json(res, 404, { error: 'not found' });
         if (req.method === 'DELETE') { state.keys = state.keys.filter((x) => x !== k); persistNow(); return json(res, 200, { ok: true }); }
         if (req.method === 'PATCH') {
           const b = JSON.parse(await readBody(req, 65536));
@@ -542,6 +706,7 @@ const server = http.createServer(async (req, res) => {
         }
       }
       if (p === '/api/token' && req.method === 'POST') {
+        if (!auth.admin) return json(res, 403, { error: 'admin only' });
         state.token = crypto.randomBytes(18).toString('base64url');
         persistNow(); return json(res, 200, { ok: true, token: state.token });
       }
@@ -549,12 +714,15 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p.startsWith('/v1/')) {
-      if (!authorized(req)) return json(res, 401, { error: { message: 'unauthorized', type: 'auth_error' } });
+      const auth = authOf(req);
+      if (!auth) return json(res, 401, { error: { message: 'unauthorized', type: 'auth_error' } });
       if (p === '/v1/models' && req.method === 'GET') {
-        const ids = new Set();
-        for (const k of state.keys) { const pr = resolveProvider(k); if (pr) pr.models.forEach((m) => ids.add(m)); }
-        Object.keys(ALIASES).forEach((id) => ids.add(id));
-        return json(res, 200, { object: 'list', data: [...ids].map((id) => ({ id, object: 'model', owned_by: 'logic-router' })) });
+        const ids = auth.admin ? new Set(['auto', 'paid']) : new Set(['auto', 'paid']);
+        if (auth.admin) {
+          for (const k of state.keys) { const pr = resolveProvider(k); if (pr) pr.models.forEach((m) => ids.add(m)); }
+          Object.keys(ALIASES).forEach((id) => ids.add(id));
+        }
+        return json(res, 200, { object: 'list', data: [...ids].map((id) => ({ id, object: 'model', owned_by: 'logic-router', description: id === 'paid' ? 'owner-paid route, usage logged' : id === 'auto' ? 'smart free pool' : undefined })) });
       }
 
       if (p === '/v1/chat/completions' && req.method === 'POST') {
@@ -564,6 +732,17 @@ const server = http.createServer(async (req, res) => {
         if (!body || !Array.isArray(body.messages)) return json(res, 400, { error: { message: 'messages must be an array' } });
 
         const requested = typeof body.model === 'string' ? body.model : 'auto';
+        if (!auth.admin && requested !== 'auto' && requested !== 'paid') {
+          return json(res, 403, { error: { message: 'only auto and paid models are available', type: 'model_forbidden' } });
+        }
+        const q = quotaCheck(auth);
+        if (q) {
+          res.setHeader('Retry-After', String(q.retry));
+          return json(res, 429, { error: { message: 'quota exceeded', type: q.type } });
+        }
+        const paid = requested === 'paid';
+        const task = requested === 'auto' ? taskOf(body.messages) : null;
+        res.setHeader('x-logic-router-task', task || 'exact');
         const wantStream = !!body.stream;
         const noCache = body.cache === false || (body.cache_control && body.cache_control.type === 'no-cache');
         delete body.cache; delete body.cache_control;
@@ -571,11 +750,11 @@ const server = http.createServer(async (req, res) => {
         const cacheable = CACHE_ENABLED && !wantStream && !noCache;
 
         if (cacheable) {
-          const hit = cacheGet(ckey);
+          const hit = cacheGet(ckey, auth.id, paid);
           if (hit) {
             metrics.requests++; metrics.ok++; recordLatency(0);
             res.setHeader('x-logic-router-cache', 'HIT');
-            accessLog({ rid, status: 200, cache: 'HIT', model: requested });
+            accessLog({ rid, ownerId: auth.id, status: 200, cache: 'HIT', model: requested });
             return json(res, 200, hit.value);
           }
           const pending = inflightByKey.get(ckey);
@@ -584,7 +763,7 @@ const server = http.createServer(async (req, res) => {
             if (shared) {
               metrics.requests++; metrics.ok++; cacheStats.coalesced++;
               res.setHeader('x-logic-router-cache', 'COALESCED');
-              accessLog({ rid, status: 200, cache: 'COALESCED', model: requested });
+              accessLog({ rid, ownerId: auth.id, status: 200, cache: 'COALESCED', model: requested });
               return json(res, 200, shared);
             }
           }
@@ -610,19 +789,19 @@ const server = http.createServer(async (req, res) => {
         delete payload.model; delete payload._droidrush; delete payload._keyId;
         const errors = [];
         try {
-          const candidates = await waitForCandidate(requested, CFG.queueTimeout);
+          const candidates = await waitForCandidate(requested, task, CFG.queueTimeout);
           if (!candidates.length) {
             if (cacheable) {
               const stale = cacheGetStale(ckey);
               if (stale) {
                 cacheStats.stale++;
                 res.setHeader('x-logic-router-cache', 'STALE');
-                accessLog({ rid, status: 200, cache: 'STALE', model: requested });
+                accessLog({ rid, ownerId: auth.id, status: 200, cache: 'STALE', model: requested });
                 if (shared) shared.resolve(stale.value);
                 return json(res, 200, stale.value);
               }
             }
-            return json(res, 503, { error: { message: 'no available free provider/key. Add a key or wait for cooldown.', type: 'no_provider' } });
+            return json(res, 503, { error: { message: paid ? 'no paid route configured. Ask the admin to add a paid key.' : 'no available free provider/key. Add a key or wait for cooldown.', type: paid ? 'no_paid_route' : 'no_provider' } });
           }
           for (const c of candidates) {
             for (let attempt = 0; attempt <= CFG.retries; attempt++) {
@@ -635,7 +814,7 @@ const server = http.createServer(async (req, res) => {
                 if (timeout) metrics.upstreamTimeouts++;
                 breakerFailure(c.key, timeout ? 10000 : 3000);
                 providerStat(c.provider.name).fail++;
-                recordUsage(c.provider.name, false, null);
+                recordUsage(auth.id, c.provider.name, false, null, paid);
                 errors.push(c.provider.name + ': ' + (timeout ? 'upstream timeout' : e.message));
                 if (!timeout && attempt < CFG.retries) { metrics.retries++; await sleep(150 + jitter(300)); continue; }
                 break;
@@ -649,16 +828,16 @@ const server = http.createServer(async (req, res) => {
                   const delay = parseRetryAfter(up);
                   breakerFailure(c.key, retryable ? delay : 5000);
                   providerStat(c.provider.name).fail++;
-                  recordUsage(c.provider.name, false, null);
+                  recordUsage(auth.id, c.provider.name, false, null, paid);
                   errors.push(`${c.provider.name} HTTP ${status}: ${detail.slice(0, 160)}`);
-                  addLog({ kind: 'fail', provider: c.provider.name, model: c.model, status, rid });
+                  addLog({ kind: 'fail', provider: c.provider.name, model: c.model, status, rid, ownerId: auth.id, task });
                   if (retryable && status >= 500 && attempt < CFG.retries) { metrics.retries++; await sleep(200 + jitter(400)); continue; }
                   break;
                 }
                 c.key.requests.min++; c.key.requests.hour++; c.key.requests.day++;
                 breakerSuccess(c.key);
                 providerStat(c.provider.name).ok++;
-                addLog({ kind: 'ok', provider: c.provider.name, model: c.model, stream: wantStream, rid });
+                addLog({ kind: 'ok', provider: c.provider.name, model: c.model, stream: wantStream, rid, ownerId: auth.id, task });
 
                 if (wantStream) {
                   call.clear();
@@ -679,8 +858,8 @@ const server = http.createServer(async (req, res) => {
                   } finally {
                     clearTimeout(idle); reader.releaseLock(); res.end();
                   }
-                  recordUsage(c.provider.name, true, null);
-                  accessLog({ rid, status: 200, provider: c.provider.name, model: c.model, stream: true, ms: Date.now() - t0 });
+                  recordUsage(auth.id, c.provider.name, true, null, paid);
+                  accessLog({ rid, ownerId: auth.id, status: 200, provider: c.provider.name, model: c.model, stream: true, ms: Date.now() - t0 });
                   metrics.ok++; adapt(true);
                   return;
                 }
@@ -690,8 +869,8 @@ const server = http.createServer(async (req, res) => {
                 if (!result.usage) result.usage = {};
                 result.usage.provider = c.provider.name;
                 cacheSet(ckey, result, { model: c.model, provider: c.provider.name, tokensIn: tin, tokensOut: tout });
-                recordUsage(c.provider.name, true, result.usage);
-                accessLog({ rid, status: 200, provider: c.provider.name, model: c.model, ms: Date.now() - t0, tokensIn: tin, tokensOut: tout });
+                recordUsage(auth.id, c.provider.name, true, result.usage, paid);
+                accessLog({ rid, ownerId: auth.id, status: 200, provider: c.provider.name, model: c.model, ms: Date.now() - t0, tokensIn: tin, tokensOut: tout });
                 if (shared) shared.resolve(result);
                 metrics.ok++; adapt(true);
                 return json(res, 200, result);
@@ -712,7 +891,7 @@ const server = http.createServer(async (req, res) => {
           }
           if (shared) shared.resolve(null);
           metrics.failed++; adapt(false);
-          accessLog({ rid, status: 502, errors: errors.length, ms: Date.now() - t0 });
+          accessLog({ rid, ownerId: auth.id, status: 502, errors: errors.length, ms: Date.now() - t0 });
           return json(res, 502, { error: { message: 'all providers failed', type: 'upstream_error', details: errors } });
         } finally {
           if (shared && inflightByKey.get(ckey) === shared) { inflightByKey.delete(ckey); shared.resolve(null); }
